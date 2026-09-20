@@ -72,6 +72,6 @@ creepty/
 - A forma da resposta do modelo vem do schema Pydantic em segmenter.py, não do prompt. Campos novos exigem mexer na classe Scene
 - Histórias acima de ~500 palavras podem truncar o JSON. A solução é partir o texto em blocos e chamar o split_story por bloco
 - Com 8GB de VRAM, o Ollama e o ComfyUI competem pela mesma memória. OLLAMA_KEEP_ALIVE=0 descarrega o modelo logo após a resposta
-
+- 
 
 
