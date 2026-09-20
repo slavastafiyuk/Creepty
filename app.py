@@ -6,10 +6,10 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
 )
 
-from pipeline.segmenter import DEFAULT_SYSTEM, Scene, split_story
+from pipeline.segmenter import DEFAULT_SYSTEM, Scene, split_long_story
 
 
-class Gerador(QObject):
+class Generator(QObject):
     """Runs outside the UI thread so the UI doesn't get blocked."""
 
     progresso = Signal(str)
@@ -24,12 +24,12 @@ class Gerador(QObject):
 
     def correr(self):
         try:
-            self.progresso.emit("A dividir a história em cenas...")
-            cenas = split_story(self.historia, self.prompt)
+            self.progresso.emit("Spliting story into the scenes...")
+            cenas = split_long_story(self.historia, self.prompt)
             self.cenas_prontas.emit(cenas)
-            self.terminado.emit(f"Pronto. {len(cenas)} cenas.")
+            self.terminado.emit(f"Done. {len(cenas)} scenes.")
         except Exception as erro:
-            self.falhou.emit(f"Falhou: {erro}")
+            self.falhou.emit(f"Failed: {erro}")
 
 
 class Janela(QMainWindow):
@@ -108,7 +108,7 @@ class Janela(QMainWindow):
         self.tabela.setRowCount(0)
 
         self.thread = QThread()
-        self.worker = Gerador(texto, prompt)
+        self.worker = Generator(texto, prompt)
         self.worker.moveToThread(self.thread)
 
         self.thread.started.connect(self.worker.correr)

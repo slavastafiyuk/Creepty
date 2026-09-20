@@ -37,3 +37,29 @@ def split_story(story: str, system_prompt: str = DEFAULT_SYSTEM) -> list[Scene]:
     if not scenes:
         raise ValueError("The model returned no scenes.")
     return scenes
+
+def chunk_story(story: str, max_words: int = 400) -> list[str]:
+    """Groups paragraphs into chunks small enough for one model call."""
+    chunks, current, count = [], [], 0
+
+    for paragraph in [p for p in story.split("\n") if p.strip()]:
+        words = len(paragraph.split())
+        if count + words > max_words and current:
+            chunks.append("\n".join(current))
+            current, count = [], 0
+        current.append(paragraph)
+        count += words
+
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
+def split_long_story(
+    story: str, system_prompt: str = DEFAULT_SYSTEM
+) -> list[Scene]:
+    """Splits a story of any length, one model call per chunk."""
+    scenes = []
+    for chunk in chunk_story(story):
+        scenes.extend(split_story(chunk, system_prompt))
+    return scenes
