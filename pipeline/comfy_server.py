@@ -8,7 +8,7 @@ from pathlib import Path
 from pipeline import images
 
 COMFY_DIR = Path(os.environ.get("CREEPTY_COMFY_DIR", r"C:\AI\ComfyUI"))
-COMFY_PYTHON = COMFY_DIR / "venv" / "Scripts" / "python.exe"
+COMFY_PYTHON = COMFY_DIR / "venv" / "scripts" / "python.exe"
 STARTUP_TIMEOUT = 180   # first launch loads CUDA and can be slow
 
 _process: subprocess.Popen | None = None
