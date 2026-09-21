@@ -1,5 +1,7 @@
 import sys
 import time
+import uuid
+from datetime import datetime
 
 from PySide6.QtCore import QObject, QThread, Qt, QUrl, Signal
 from PySide6.QtGui import QPixmap
@@ -10,6 +12,7 @@ from PySide6.QtWidgets import (
     QSplitter, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
 )
 
+from pipeline import comfy_server, images
 from pipeline.segmenter import (
     DEFAULT_SYSTEM, Scene, split_sentences, stream_story,
 )
@@ -18,6 +21,35 @@ PREVIEW_CHARS = 70
 WORDS_PER_MINUTE = 150
 THUMB_HEIGHT = 200
 
+
+# ---------- shared pipeline helpers ----------
+
+def new_run_id() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def build_image_prompt(scene: Scene) -> str:
+    """Structured prompt: the Qwen3 text encoder reads labelled fields."""
+    lines = [
+        f"context: {scene.text.strip()}",
+        f"image: {scene.image_prompt.strip()}",
+    ]
+    if scene.mood.strip():
+        lines.append(f"mood: {scene.mood.strip()}")
+    return "\n".join(lines)
+
+
+def asset_name(run_id: str, row: int) -> str:
+    # The suffix keeps every render unique, so a moved or regenerated scene
+    # never points at a file that belongs to another scene.
+    return f"{run_id}/scene_{row + 1:03d}_{uuid.uuid4().hex[:6]}"
+
+
+def can_render(scene: Scene) -> bool:
+    return bool(scene.text.strip() and scene.image_prompt.strip())
+
+
+# ---------- workers ----------
 
 class Generator(QObject):
     """Runs the whole pipeline off the UI thread: scenes, images, voice."""
@@ -28,16 +60,18 @@ class Generator(QObject):
     finished = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, story: str, prompt: str):
+    def __init__(self, story: str, prompt: str, run_id: str):
         super().__init__()
         self.story = story
         self.prompt = prompt
+        self.run_id = run_id
         self.scenes: list[Scene] = []
         self.cancelled = False
 
     def cancel(self):
-        """Checked between steps; a running model call still finishes."""
+        """Checked between steps; also stops the image being rendered."""
         self.cancelled = True
+        images.interrupt()
 
     def run(self):
         try:
@@ -50,6 +84,17 @@ class Generator(QObject):
                 self.scenes.extend(scenes)
                 self.scenes_ready.emit(index, scenes)
 
+            if self.cancelled:
+                self.finished.emit("Cancelled.")
+                return
+
+            self.progress.emit("Starting ComfyUI...")
+            if not comfy_server.start():
+                self.failed.emit(
+                    f"Couldn't start ComfyUI in {comfy_server.COMFY_DIR}."
+                )
+                return
+
             self.generate_assets()
             self.finished.emit("Cancelled." if self.cancelled else "Done.")
         except Exception as error:
@@ -57,16 +102,19 @@ class Generator(QObject):
 
     def generate_assets(self):
         """Images and voice, one scene at a time, timing each asset."""
+        total = len(self.scenes)
         for row, scene in enumerate(self.scenes):
             if self.cancelled:
                 return
             if not scene.text.strip():
                 continue
 
-            self.progress.emit(f"Scene {row + 1}: image...")
-            start = time.monotonic()
-            path = self.make_image(scene)
-            if path:
+            if can_render(scene):
+                self.progress.emit(f"Scene {row + 1} of {total}: image...")
+                start = time.monotonic()
+                path = images.generate_image(
+                    build_image_prompt(scene), asset_name(self.run_id, row)
+                )
                 self.asset_done.emit(
                     row, "image", path, time.monotonic() - start
                 )
@@ -74,20 +122,66 @@ class Generator(QObject):
             if self.cancelled:
                 return
 
-            self.progress.emit(f"Scene {row + 1}: voice...")
+            self.progress.emit(f"Scene {row + 1} of {total}: voice...")
             start = time.monotonic()
-            path = self.make_voice(scene)
+            path = self.make_voice(row, scene)
             if path:
                 self.asset_done.emit(
                     row, "audio", path, time.monotonic() - start
                 )
 
-    def make_image(self, scene: Scene) -> str | None:
-        return None   # TODO: ComfyUI call, returns the saved file path
-
-    def make_voice(self, scene: Scene) -> str | None:
+    def make_voice(self, row: int, scene: Scene) -> str | None:
         return None   # TODO: Kokoro call, returns the saved file path
 
+
+class ImageWorker(QObject):
+    """Renders images for specific scenes, using their current edited state."""
+
+    progress = Signal(str)
+    asset_done = Signal(int, str, str, float)   # row, kind, path, seconds
+    finished = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, jobs: list[tuple[int, Scene]], run_id: str):
+        super().__init__()
+        self.jobs = jobs
+        self.run_id = run_id
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
+        images.interrupt()
+
+    def run(self):
+        try:
+            self.progress.emit("Starting ComfyUI...")
+            if not comfy_server.start():
+                self.failed.emit(
+                    f"Couldn't start ComfyUI in {comfy_server.COMFY_DIR}."
+                )
+                return
+
+            total = len(self.jobs)
+            for index, (row, scene) in enumerate(self.jobs, start=1):
+                if self.cancelled:
+                    break
+                self.progress.emit(
+                    f"Image {index} of {total} (scene {row + 1})..."
+                )
+                start = time.monotonic()
+                path = images.generate_image(
+                    build_image_prompt(scene), asset_name(self.run_id, row)
+                )
+                self.asset_done.emit(
+                    row, "image", path, time.monotonic() - start
+                )
+
+            self.finished.emit("Cancelled." if self.cancelled else "Done.")
+        except Exception as error:
+            self.failed.emit(f"Failed: {error}")
+
+
+# ---------- window ----------
 
 class Window(QMainWindow):
     def __init__(self):
@@ -101,6 +195,8 @@ class Window(QMainWindow):
         self.current = -1
         self.loading = False      # guards the detail fields against feedback
         self.segmenting = False   # scene count isn't final while this is True
+        self.busy = False         # any worker running
+        self.run_id: str | None = None
 
         # Seconds per generated asset, used for the ETA.
         self.asset_times: list[float] = []
@@ -113,6 +209,7 @@ class Window(QMainWindow):
         self.setWindowTitle("Creepty")
         self.resize(1200, 880)
         self.setCentralWidget(self._build())
+        self.set_busy(False)
         self.update_progress()
 
     # ---------- construction ----------
@@ -152,7 +249,6 @@ class Window(QMainWindow):
         self.button.clicked.connect(self.generate)
 
         self.cancel_button = QPushButton("Cancel")
-        self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self.cancel)
 
         self.reset = QPushButton("Reset prompt")
@@ -219,12 +315,14 @@ class Window(QMainWindow):
         self.split_button = QPushButton("Split")
         self.up_button = QPushButton("Up")
         self.down_button = QPushButton("Down")
+        self.missing_button = QPushButton("Generate missing")
 
         self.insert_button.clicked.connect(self.insert_scene)
         self.delete_button.clicked.connect(self.delete_scene)
         self.split_button.clicked.connect(self.split_scene)
         self.up_button.clicked.connect(lambda: self.move_scene(-1))
         self.down_button.clicked.connect(lambda: self.move_scene(1))
+        self.missing_button.clicked.connect(self.generate_missing)
 
         buttons = QHBoxLayout()
         for widget in (
@@ -232,6 +330,8 @@ class Window(QMainWindow):
             self.up_button, self.down_button,
         ):
             buttons.addWidget(widget)
+        buttons.addStretch()
+        buttons.addWidget(self.missing_button)
 
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -270,7 +370,6 @@ class Window(QMainWindow):
         return panel
 
     def _preview_row(self) -> QWidget:
-        # Image slot: an empty frame until the ComfyUI step fills image_path.
         self.thumbnail = QLabel("No image yet")
         self.thumbnail.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.thumbnail.setFixedHeight(THUMB_HEIGHT)
@@ -278,8 +377,7 @@ class Window(QMainWindow):
         self.thumbnail.setStyleSheet("color: #888;")
 
         self.image_button = QPushButton("Generate image")
-        self.image_button.setEnabled(False)   # enable once ComfyUI is wired up
-        self.image_button.setToolTip("Not implemented yet")
+        self.image_button.clicked.connect(self.generate_current_image)
 
         # Audio slot: plays audio_path through the shared QMediaPlayer.
         self.audio_label = QLabel("No audio yet")
@@ -315,6 +413,26 @@ class Window(QMainWindow):
         box = QWidget()
         box.setLayout(layout)
         return box
+
+    # ---------- busy state ----------
+
+    def set_busy(self, busy: bool):
+        """Locks everything that would shift rows under a running worker."""
+        self.busy = busy
+        self.button.setEnabled(not busy)
+        self.cancel_button.setEnabled(busy)
+        for widget in (
+            self.insert_button, self.delete_button, self.split_button,
+            self.up_button, self.down_button, self.missing_button,
+        ):
+            widget.setEnabled(not busy)
+        self.refresh_image_button()
+
+    def refresh_image_button(self):
+        selected = 0 <= self.current < len(self.scenes)
+        self.image_button.setEnabled(
+            selected and not self.busy and can_render(self.scenes[self.current])
+        )
 
     # ---------- progress ----------
 
@@ -441,6 +559,8 @@ class Window(QMainWindow):
 
         if 0 <= keep_row < len(self.scenes):
             self.table.selectRow(keep_row)
+        else:
+            self.load_detail()
 
         self.update_progress()
 
@@ -449,7 +569,7 @@ class Window(QMainWindow):
     def load_detail(self):
         rows = self.table.selectionModel().selectedRows()
         self.current = rows[0].row() if rows else -1
-        enabled = self.current >= 0
+        enabled = 0 <= self.current < len(self.scenes)
 
         self.loading = True
         for widget in (self.detail_text, self.detail_image, self.detail_mood):
@@ -467,6 +587,7 @@ class Window(QMainWindow):
             self.detail_mood.clear()
             self.load_previews(None)
         self.loading = False
+        self.refresh_image_button()
 
     def save_detail(self):
         if self.loading or self.current < 0:
@@ -484,6 +605,7 @@ class Window(QMainWindow):
         self.refresh_row(self.current)
         self.table.blockSignals(False)
         self.update_progress()
+        self.refresh_image_button()
 
     # ---------- scene operations ----------
 
@@ -572,7 +694,26 @@ class Window(QMainWindow):
         )
         self.refresh_table(keep_row=target)
 
-    # ---------- generation ----------
+    # ---------- running workers ----------
+
+    def start_worker(self, worker: QObject):
+        """Wires the signals every worker shares and starts it on a thread."""
+        self.set_busy(True)
+
+        self.thread = QThread()
+        self.worker = worker
+        self.worker.moveToThread(self.thread)
+
+        self.thread.started.connect(self.worker.run)
+        self.worker.progress.connect(self.status.setText)
+        self.worker.asset_done.connect(self.asset_ready)
+        self.worker.finished.connect(self.status.setText)
+        self.worker.failed.connect(self.status.setText)
+        self.worker.finished.connect(self.thread.quit)
+        self.worker.failed.connect(self.thread.quit)
+        self.thread.finished.connect(self.generation_over)
+
+        self.thread.start()
 
     def generate(self):
         story = self.story.toPlainText().strip()
@@ -585,28 +726,36 @@ class Window(QMainWindow):
             self.status.setText("The prompt can't be empty.")
             return
 
-        self.button.setEnabled(False)
-        self.cancel_button.setEnabled(True)
         self.scenes = []
         self.asset_times = []
         self.segmenting = True
+        self.run_id = new_run_id()
         self.refresh_table()
 
-        self.thread = QThread()
-        self.worker = Generator(story, prompt)
-        self.worker.moveToThread(self.thread)
+        worker = Generator(story, prompt, self.run_id)
+        worker.scenes_ready.connect(self.show_scenes)
+        self.start_worker(worker)
 
-        self.thread.started.connect(self.worker.run)
-        self.worker.progress.connect(self.status.setText)
-        self.worker.scenes_ready.connect(self.show_scenes)
-        self.worker.asset_done.connect(self.asset_ready)
-        self.worker.finished.connect(self.status.setText)
-        self.worker.failed.connect(self.status.setText)
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.failed.connect(self.thread.quit)
-        self.thread.finished.connect(self.generation_over)
+    def run_images(self, rows: list[int]):
+        jobs = [(row, self.scenes[row]) for row in rows]
+        if not jobs:
+            self.status.setText("No scenes to render.")
+            return
+        if self.run_id is None:
+            self.run_id = new_run_id()
+        self.start_worker(ImageWorker(jobs, self.run_id))
 
-        self.thread.start()
+    def generate_current_image(self):
+        if 0 <= self.current < len(self.scenes):
+            self.run_images([self.current])
+
+    def generate_missing(self):
+        self.run_images(
+            [
+                row for row, scene in enumerate(self.scenes)
+                if not scene.image_path and can_render(scene)
+            ]
+        )
 
     def cancel(self):
         if self.worker:
@@ -616,13 +765,13 @@ class Window(QMainWindow):
 
     def generation_over(self):
         self.segmenting = False
-        self.button.setEnabled(True)
-        self.cancel_button.setEnabled(False)
+        self.set_busy(False)
         self.update_progress()
 
 
 if __name__ == "__main__":
     qt = QApplication(sys.argv)
-    window = Window
+    qt.aboutToQuit.connect(comfy_server.stop)   # close ComfyUI with the app
+    window = Window()
     window.show()
     sys.exit(qt.exec())

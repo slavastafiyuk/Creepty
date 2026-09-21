@@ -154,6 +154,7 @@ def _call(sentences: list[str], system_prompt: str, ctx: int) -> list[Scene]:
         ],
         format=Boundaries.model_json_schema(),
         options={"temperature": 0.2, "num_ctx": ctx, "num_predict": 4096},
+        keep_alive=0,
     )
 
     raw = Boundaries.model_validate_json(response.message.content).scenes
