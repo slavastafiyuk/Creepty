@@ -1,130 +1,628 @@
 import sys
+import time
 
-from PySide6.QtCore import QObject, QThread, Signal
+from PySide6.QtCore import QObject, QThread, Qt, QUrl, Signal
+from PySide6.QtGui import QPixmap
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
-    QApplication, QHeaderView, QLabel, QMainWindow, QPushButton,
-    QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QFormLayout, QFrame, QHBoxLayout,
+    QHeaderView, QLabel, QLineEdit, QMainWindow, QProgressBar, QPushButton,
+    QSplitter, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
 )
 
-from pipeline.segmenter import DEFAULT_SYSTEM, Scene, split_long_story
+from pipeline.segmenter import (
+    DEFAULT_SYSTEM, Scene, split_sentences, stream_story,
+)
+
+PREVIEW_CHARS = 70
+WORDS_PER_MINUTE = 150
+THUMB_HEIGHT = 200
 
 
 class Generator(QObject):
-    """Runs outside the UI thread so the UI doesn't get blocked."""
+    """Runs the whole pipeline off the UI thread: scenes, images, voice."""
 
-    progresso = Signal(str)
-    cenas_prontas = Signal(list)
-    terminado = Signal(str)
-    falhou = Signal(str)
+    progress = Signal(str)
+    scenes_ready = Signal(int, list)            # batch index, scenes
+    asset_done = Signal(int, str, str, float)   # row, kind, path, seconds
+    finished = Signal(str)
+    failed = Signal(str)
 
-    def __init__(self, historia: str, prompt: str):
+    def __init__(self, story: str, prompt: str):
         super().__init__()
-        self.historia = historia
+        self.story = story
         self.prompt = prompt
+        self.scenes: list[Scene] = []
+        self.cancelled = False
 
-    def correr(self):
+    def cancel(self):
+        """Checked between steps; a running model call still finishes."""
+        self.cancelled = True
+
+    def run(self):
         try:
-            self.progresso.emit("Spliting story into the scenes...")
-            cenas = split_long_story(self.historia, self.prompt)
-            self.cenas_prontas.emit(cenas)
-            self.terminado.emit(f"Done. {len(cenas)} scenes.")
-        except Exception as erro:
-            self.falhou.emit(f"Failed: {erro}")
+            self.progress.emit("Splitting the story...")
+            for index, total, scenes in stream_story(self.story, self.prompt):
+                if self.cancelled:
+                    self.finished.emit("Cancelled.")
+                    return
+                self.progress.emit(f"Batch {index} of {total}...")
+                self.scenes.extend(scenes)
+                self.scenes_ready.emit(index, scenes)
+
+            self.generate_assets()
+            self.finished.emit("Cancelled." if self.cancelled else "Done.")
+        except Exception as error:
+            self.failed.emit(f"Failed: {error}")
+
+    def generate_assets(self):
+        """Images and voice, one scene at a time, timing each asset."""
+        for row, scene in enumerate(self.scenes):
+            if self.cancelled:
+                return
+            if not scene.text.strip():
+                continue
+
+            self.progress.emit(f"Scene {row + 1}: image...")
+            start = time.monotonic()
+            path = self.make_image(scene)
+            if path:
+                self.asset_done.emit(
+                    row, "image", path, time.monotonic() - start
+                )
+
+            if self.cancelled:
+                return
+
+            self.progress.emit(f"Scene {row + 1}: voice...")
+            start = time.monotonic()
+            path = self.make_voice(scene)
+            if path:
+                self.asset_done.emit(
+                    row, "audio", path, time.monotonic() - start
+                )
+
+    def make_image(self, scene: Scene) -> str | None:
+        return None   # TODO: ComfyUI call, returns the saved file path
+
+    def make_voice(self, scene: Scene) -> str | None:
+        return None   # TODO: Kokoro call, returns the saved file path
 
 
-class Janela(QMainWindow):
+class Window(QMainWindow):
     def __init__(self):
         super().__init__()
         # Keep references alive: a local QThread gets collected mid-run.
         self.worker = None
         self.thread = None
 
-        self.setWindowTitle("Creepty")
-        self.resize(900, 780)
+        # The list is the source of truth; the table is only a view of it.
+        self.scenes: list[Scene] = []
+        self.current = -1
+        self.loading = False      # guards the detail fields against feedback
+        self.segmenting = False   # scene count isn't final while this is True
 
+        # Seconds per generated asset, used for the ETA.
+        self.asset_times: list[float] = []
+
+        # One player for the whole window; the output must stay referenced.
+        self.player = QMediaPlayer()
+        self.audio_output = QAudioOutput()
+        self.player.setAudioOutput(self.audio_output)
+
+        self.setWindowTitle("Creepty")
+        self.resize(1200, 880)
+        self.setCentralWidget(self._build())
+        self.update_progress()
+
+    # ---------- construction ----------
+
+    def _build(self) -> QWidget:
+        root = QVBoxLayout()
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(10)
+        root.addWidget(QLabel("Model instructions"))
+        root.addWidget(self._prompt_box())
+        root.addWidget(QLabel("Story"))
+        root.addWidget(self._story_box())
+        root.addLayout(self._action_row())
+        root.addWidget(self.status)
+        root.addWidget(self._scene_area(), stretch=1)
+
+        central = QWidget()
+        central.setLayout(root)
+        return central
+
+    def _prompt_box(self) -> QWidget:
         self.prompt = QTextEdit()
         self.prompt.setPlainText(DEFAULT_SYSTEM)
-        self.prompt.setMaximumHeight(120)
+        self.prompt.setMaximumHeight(90)
+        return self.prompt
 
-        self.historia = QTextEdit()
-        self.historia.setPlaceholderText(
-            "Cola aqui o texto que queres transformar em vídeo."
+    def _story_box(self) -> QWidget:
+        self.story = QTextEdit()
+        self.story.setPlaceholderText(
+            "Paste the text you want to turn into a video."
         )
+        self.story.setMaximumHeight(140)
+        return self.story
 
-        self.botao = QPushButton("Gerar vídeo")
-        self.botao.clicked.connect(self.gerar)
+    def _action_row(self) -> QHBoxLayout:
+        self.button = QPushButton("Generate")
+        self.button.clicked.connect(self.generate)
 
-        self.reset = QPushButton("Repor prompt")
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.clicked.connect(self.cancel)
+
+        self.reset = QPushButton("Reset prompt")
         self.reset.clicked.connect(
             lambda: self.prompt.setPlainText(DEFAULT_SYSTEM)
         )
 
-        self.estado = QLabel("")
+        self.status = QLabel("")
 
-        self.tabela = QTableWidget(0, 3)
-        self.tabela.setHorizontalHeaderLabels(["Texto", "Imagem", "Mood"])
-        self.tabela.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFormat("%v of %m assets")
+        self.progress_bar.setMinimumWidth(280)
+
+        self.eta = QLabel("")
+        self.eta.setStyleSheet("color: #888;")
+
+        row = QHBoxLayout()
+        row.addWidget(self.button)
+        row.addWidget(self.cancel_button)
+        row.addWidget(self.reset)
+        row.addStretch()
+        row.addWidget(self.progress_bar)
+        row.addWidget(self.eta)
+        return row
+
+    def _scene_area(self) -> QWidget:
+        split = QSplitter(Qt.Orientation.Horizontal)
+        split.addWidget(self._scene_list())
+        split.addWidget(self._detail_panel())
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 3)
+        return split
+
+    def _scene_list(self) -> QWidget:
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(
+            ["#", "Scene", "Mood", "~Time", "Assets"]
         )
-        self.tabela.setWordWrap(True)
+        self.table.verticalHeader().setVisible(False)
+        # Read-only and single-line: long text never blows up a row.
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.table.setWordWrap(False)
+        self.table.verticalHeader().setDefaultSectionSize(28)
+
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for column in (2, 3, 4):
+            header.setSectionResizeMode(
+                column, QHeaderView.ResizeMode.ResizeToContents
+            )
+
+        self.table.itemSelectionChanged.connect(self.load_detail)
+
+        self.insert_button = QPushButton("Insert")
+        self.delete_button = QPushButton("Delete")
+        self.split_button = QPushButton("Split")
+        self.up_button = QPushButton("Up")
+        self.down_button = QPushButton("Down")
+
+        self.insert_button.clicked.connect(self.insert_scene)
+        self.delete_button.clicked.connect(self.delete_scene)
+        self.split_button.clicked.connect(self.split_scene)
+        self.up_button.clicked.connect(lambda: self.move_scene(-1))
+        self.down_button.clicked.connect(lambda: self.move_scene(1))
+
+        buttons = QHBoxLayout()
+        for widget in (
+            self.insert_button, self.delete_button, self.split_button,
+            self.up_button, self.down_button,
+        ):
+            buttons.addWidget(widget)
 
         layout = QVBoxLayout()
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(12)
-        layout.addWidget(QLabel("Instruções para o modelo"))
-        layout.addWidget(self.prompt)
-        layout.addWidget(self.reset)
-        layout.addWidget(QLabel("História"))
-        layout.addWidget(self.historia)
-        layout.addWidget(self.botao)
-        layout.addWidget(self.estado)
-        layout.addWidget(self.tabela)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.table)
+        layout.addLayout(buttons)
 
-        central = QWidget()
-        central.setLayout(layout)
-        self.setCentralWidget(central)
+        panel = QWidget()
+        panel.setLayout(layout)
+        return panel
 
-    def mostrar_cenas(self, cenas: list[Scene]):
-        self.tabela.setRowCount(len(cenas))
-        for linha, cena in enumerate(cenas):
-            for coluna, valor in enumerate(
-                [cena.text, cena.image_prompt, cena.mood]
-            ):
-                self.tabela.setItem(linha, coluna, QTableWidgetItem(valor))
-        self.tabela.resizeRowsToContents()
+    def _detail_panel(self) -> QWidget:
+        self.detail_text = QTextEdit()
+        self.detail_text.setPlaceholderText("Select a scene on the left.")
+        self.detail_image = QTextEdit()
+        self.detail_image.setMaximumHeight(80)
+        self.detail_mood = QLineEdit()
 
-    def gerar(self):
-        texto = self.historia.toPlainText().strip()
+        for widget in (self.detail_text, self.detail_image, self.detail_mood):
+            widget.setEnabled(False)
+
+        self.detail_text.textChanged.connect(self.save_detail)
+        self.detail_image.textChanged.connect(self.save_detail)
+        self.detail_mood.textChanged.connect(self.save_detail)
+
+        form = QFormLayout()
+        form.setContentsMargins(12, 0, 0, 0)
+        form.addRow(QLabel("Narration text"))
+        form.addRow(self.detail_text)
+        form.addRow(QLabel("Image prompt"))
+        form.addRow(self.detail_image)
+        form.addRow("Mood", self.detail_mood)
+        form.addRow(self._preview_row())
+
+        panel = QWidget()
+        panel.setLayout(form)
+        return panel
+
+    def _preview_row(self) -> QWidget:
+        # Image slot: an empty frame until the ComfyUI step fills image_path.
+        self.thumbnail = QLabel("No image yet")
+        self.thumbnail.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.thumbnail.setFixedHeight(THUMB_HEIGHT)
+        self.thumbnail.setFrameShape(QFrame.Shape.StyledPanel)
+        self.thumbnail.setStyleSheet("color: #888;")
+
+        self.image_button = QPushButton("Generate image")
+        self.image_button.setEnabled(False)   # enable once ComfyUI is wired up
+        self.image_button.setToolTip("Not implemented yet")
+
+        # Audio slot: plays audio_path through the shared QMediaPlayer.
+        self.audio_label = QLabel("No audio yet")
+        self.audio_label.setStyleSheet("color: #888;")
+
+        self.play_button = QPushButton("Play")
+        self.play_button.setEnabled(False)
+        self.play_button.clicked.connect(self.play_audio)
+
+        self.stop_button = QPushButton("Stop")
+        self.stop_button.setEnabled(False)
+        self.stop_button.clicked.connect(self.player.stop)
+
+        self.voice_button = QPushButton("Generate voice")
+        self.voice_button.setEnabled(False)   # enable once Kokoro is wired up
+        self.voice_button.setToolTip("Not implemented yet")
+
+        audio_row = QHBoxLayout()
+        audio_row.addWidget(self.play_button)
+        audio_row.addWidget(self.stop_button)
+        audio_row.addWidget(self.voice_button)
+        audio_row.addStretch()
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 8, 0, 0)
+        layout.addWidget(QLabel("Image"))
+        layout.addWidget(self.thumbnail)
+        layout.addWidget(self.image_button)
+        layout.addWidget(QLabel("Audio"))
+        layout.addWidget(self.audio_label)
+        layout.addLayout(audio_row)
+
+        box = QWidget()
+        box.setLayout(layout)
+        return box
+
+    # ---------- progress ----------
+
+    def update_progress(self):
+        """Counts finished assets: one image and one audio per scene."""
+        total = len(self.scenes) * 2
+
+        # Nothing to track yet: hide instead of showing an empty bar.
+        self.progress_bar.setVisible(bool(total) or self.segmenting)
+        self.eta.setVisible(bool(total) or self.segmenting)
+
+        if self.segmenting:
+            self.progress_bar.setRange(0, 0)   # indeterminate
+            self.eta.setText("Splitting...")
+            return
+
+        if not total:
+            return
+
+        done = sum(
+            bool(scene.image_path) + bool(scene.audio_path)
+            for scene in self.scenes
+        )
+
+        self.progress_bar.setRange(0, total)
+        self.progress_bar.setValue(done)
+
+        remaining = total - done
+        if not remaining:
+            self.eta.setText("Complete")
+            return
+
+        if not self.asset_times:
+            self.eta.setText(f"{remaining} left")
+            return
+
+        # Average the last 10 assets: early runs are slower than steady state.
+        window = self.asset_times[-10:]
+        seconds = int(sum(window) / len(window) * remaining)
+        hours, rest = divmod(seconds, 3600)
+        minutes, secs = divmod(rest, 60)
+        eta = f"{hours}h{minutes:02d}m" if hours else f"{minutes}m{secs:02d}s"
+        self.eta.setText(f"~{eta} left")
+
+    # ---------- previews ----------
+
+    def load_previews(self, scene: Scene | None):
+        if scene is None:
+            self.thumbnail.setPixmap(QPixmap())
+            self.thumbnail.setText("No image yet")
+            self.audio_label.setText("No audio yet")
+            self.play_button.setEnabled(False)
+            self.stop_button.setEnabled(False)
+            return
+
+        if scene.image_path:
+            pixmap = QPixmap(scene.image_path)
+            if pixmap.isNull():
+                self.thumbnail.setPixmap(QPixmap())
+                self.thumbnail.setText("Image file not found")
+            else:
+                self.thumbnail.setPixmap(
+                    pixmap.scaledToHeight(
+                        THUMB_HEIGHT,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                )
+        else:
+            self.thumbnail.setPixmap(QPixmap())
+            self.thumbnail.setText("No image yet")
+
+        has_audio = bool(scene.audio_path)
+        self.audio_label.setText(
+            scene.audio_path if has_audio else "No audio yet"
+        )
+        self.play_button.setEnabled(has_audio)
+        self.stop_button.setEnabled(has_audio)
+
+    def play_audio(self):
+        if self.current < 0:
+            return
+        path = self.scenes[self.current].audio_path
+        if not path:
+            return
+        self.player.setSource(QUrl.fromLocalFile(path))
+        self.player.play()
+
+    # ---------- table rendering ----------
+
+    def preview(self, text: str) -> str:
+        flat = " ".join(text.split())
+        return flat if len(flat) <= PREVIEW_CHARS else flat[:PREVIEW_CHARS] + "…"
+
+    def duration(self, text: str) -> str:
+        seconds = round(len(text.split()) / WORDS_PER_MINUTE * 60)
+        return f"{seconds // 60}:{seconds % 60:02d}"
+
+    def assets(self, scene: Scene) -> str:
+        image = "IMG" if scene.image_path else "·"
+        audio = "SND" if scene.audio_path else "·"
+        return f"{image} {audio}"
+
+    def refresh_row(self, row: int):
+        scene = self.scenes[row]
+        for column, value in enumerate(
+            [
+                str(row + 1),
+                self.preview(scene.text) or "(empty)",
+                scene.mood,
+                self.duration(scene.text),
+                self.assets(scene),
+            ]
+        ):
+            item = QTableWidgetItem(value)
+            item.setToolTip(scene.text)   # full text on hover, no giant cell
+            self.table.setItem(row, column, item)
+
+    def refresh_table(self, keep_row: int = -1):
+        self.table.blockSignals(True)
+        self.table.setRowCount(len(self.scenes))
+        for row in range(len(self.scenes)):
+            self.refresh_row(row)
+        self.table.blockSignals(False)
+
+        if 0 <= keep_row < len(self.scenes):
+            self.table.selectRow(keep_row)
+
+        self.update_progress()
+
+    # ---------- detail panel ----------
+
+    def load_detail(self):
+        rows = self.table.selectionModel().selectedRows()
+        self.current = rows[0].row() if rows else -1
+        enabled = self.current >= 0
+
+        self.loading = True
+        for widget in (self.detail_text, self.detail_image, self.detail_mood):
+            widget.setEnabled(enabled)
+
+        if enabled:
+            scene = self.scenes[self.current]
+            self.detail_text.setPlainText(scene.text)
+            self.detail_image.setPlainText(scene.image_prompt)
+            self.detail_mood.setText(scene.mood)
+            self.load_previews(scene)
+        else:
+            self.detail_text.clear()
+            self.detail_image.clear()
+            self.detail_mood.clear()
+            self.load_previews(None)
+        self.loading = False
+
+    def save_detail(self):
+        if self.loading or self.current < 0:
+            return
+
+        scene = self.scenes[self.current]
+        self.scenes[self.current] = Scene(
+            text=self.detail_text.toPlainText(),
+            image_prompt=self.detail_image.toPlainText(),
+            mood=self.detail_mood.text(),
+            image_path=scene.image_path,   # editing text keeps the assets
+            audio_path=scene.audio_path,
+        )
+        self.table.blockSignals(True)
+        self.refresh_row(self.current)
+        self.table.blockSignals(False)
+        self.update_progress()
+
+    # ---------- scene operations ----------
+
+    def show_scenes(self, batch_index: int, scenes: list[Scene]):
+        # A capacity retry restarts from batch 1, so clear instead of appending.
+        if batch_index == 1:
+            self.scenes = []
+
+        self.scenes.extend(scenes)
+        self.segmenting = False   # scenes exist now, the bar can go determinate
+        self.refresh_table()
+        self.table.scrollToBottom()
+
+    def asset_ready(self, row: int, kind: str, path: str, seconds: float):
+        if not 0 <= row < len(self.scenes):
+            return
+
+        self.scenes[row] = self.scenes[row].model_copy(
+            update={f"{kind}_path": path}
+        )
+        self.asset_times.append(seconds)
+
+        self.table.blockSignals(True)
+        self.refresh_row(row)
+        self.table.blockSignals(False)
+        self.update_progress()
+
+        if row == self.current:
+            self.load_previews(self.scenes[row])
+
+    def insert_scene(self):
+        """Adds an empty scene after the selection, or at the end."""
+        row = self.current + 1 if self.current >= 0 else len(self.scenes)
+        self.scenes.insert(row, Scene(text="", image_prompt="", mood=""))
+        self.refresh_table(keep_row=row)
+        self.detail_text.setFocus()
+
+    def delete_scene(self):
+        if self.current < 0:
+            return
+        row = self.current
+        del self.scenes[row]
+        self.refresh_table(keep_row=min(row, len(self.scenes) - 1))
+
+    def split_scene(self):
+        """Breaks the selected scene in two at its midpoint sentence."""
+        if self.current < 0:
+            self.status.setText("Select a scene to split.")
+            return
+
+        row = self.current
+        scene = self.scenes[row]
+        sentences = split_sentences(scene.text)
+
+        if len(sentences) < 2:
+            self.status.setText("This scene has only one sentence.")
+            return
+
+        half = len(sentences) // 2
+        # Splitting invalidates the assets: they were made for the whole scene.
+        self.scenes[row] = Scene(
+            text=" ".join(sentences[:half]),
+            image_prompt=scene.image_prompt,
+            mood=scene.mood,
+        )
+        self.scenes.insert(
+            row + 1,
+            Scene(
+                text=" ".join(sentences[half:]),
+                image_prompt=scene.image_prompt,
+                mood=scene.mood,
+            ),
+        )
+        self.refresh_table(keep_row=row + 1)
+
+    def move_scene(self, offset: int):
+        if self.current < 0:
+            return
+        target = self.current + offset
+        if not 0 <= target < len(self.scenes):
+            return
+
+        row = self.current
+        self.scenes[row], self.scenes[target] = (
+            self.scenes[target], self.scenes[row],
+        )
+        self.refresh_table(keep_row=target)
+
+    # ---------- generation ----------
+
+    def generate(self):
+        story = self.story.toPlainText().strip()
         prompt = self.prompt.toPlainText().strip()
 
-        if not texto:
-            self.estado.setText("Cola uma história para começar.")
+        if not story:
+            self.status.setText("Paste a story to get started.")
             return
         if not prompt:
-            self.estado.setText("O prompt não pode ficar vazio.")
+            self.status.setText("The prompt can't be empty.")
             return
 
-        self.botao.setEnabled(False)
-        self.tabela.setRowCount(0)
+        self.button.setEnabled(False)
+        self.cancel_button.setEnabled(True)
+        self.scenes = []
+        self.asset_times = []
+        self.segmenting = True
+        self.refresh_table()
 
         self.thread = QThread()
-        self.worker = Generator(texto, prompt)
+        self.worker = Generator(story, prompt)
         self.worker.moveToThread(self.thread)
 
-        self.thread.started.connect(self.worker.correr)
-        self.worker.progresso.connect(self.estado.setText)
-        self.worker.cenas_prontas.connect(self.mostrar_cenas)
-        self.worker.terminado.connect(self.estado.setText)
-        self.worker.falhou.connect(self.estado.setText)
-        self.worker.terminado.connect(self.thread.quit)
-        self.worker.falhou.connect(self.thread.quit)
-        self.thread.finished.connect(lambda: self.botao.setEnabled(True))
+        self.thread.started.connect(self.worker.run)
+        self.worker.progress.connect(self.status.setText)
+        self.worker.scenes_ready.connect(self.show_scenes)
+        self.worker.asset_done.connect(self.asset_ready)
+        self.worker.finished.connect(self.status.setText)
+        self.worker.failed.connect(self.status.setText)
+        self.worker.finished.connect(self.thread.quit)
+        self.worker.failed.connect(self.thread.quit)
+        self.thread.finished.connect(self.generation_over)
 
         self.thread.start()
+
+    def cancel(self):
+        if self.worker:
+            self.worker.cancel()
+            self.status.setText("Cancelling after the current step...")
+            self.cancel_button.setEnabled(False)
+
+    def generation_over(self):
+        self.segmenting = False
+        self.button.setEnabled(True)
+        self.cancel_button.setEnabled(False)
+        self.update_progress()
 
 
 if __name__ == "__main__":
     qt = QApplication(sys.argv)
-    janela = Janela()
-    janela.show()
+    window = Window
+    window.show()
     sys.exit(qt.exec())
