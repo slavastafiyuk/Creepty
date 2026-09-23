@@ -17,6 +17,10 @@ MODEL = "gemma4:e4b"
 TOKENS_PER_WORD = 1.6    # rough estimate, includes the numbering overhead
 CTX_FLOOR = 4096         # never go below this, even on tiny models
 CTX_CAP = 32768          # past this, batching beats a huge context window
+MAX_SCENE_SENTENCES = 5  # matches "usually 2 to 5 sentences"; any boundary
+                          # the model returns larger than this gets split
+                          # further so narration text stays TTS-sized
+
 
 DEFAULT_SYSTEM = (
     "You split horror stories into scenes for a narrated video. "
@@ -100,39 +104,46 @@ def batch_sentences(sentences: list[str], budget: int) -> list[list[str]]:
         batches.append(current)
     return batches
 
+def _cap_length(start: int, end: int) -> list[tuple[int, int]]:
+    """Breaks a sentence range into pieces of at most MAX_SCENE_SENTENCES."""
+    pieces = []
+    cursor = start
+    while cursor <= end:
+        piece_end = min(cursor + MAX_SCENE_SENTENCES - 1, end)
+        pieces.append((cursor, piece_end))
+        cursor = piece_end + 1
+    return pieces
+
 
 def repair(raw: list[Boundary], total: int) -> list[Boundary]:
     """Forces the model's ranges into a clean partition of the sentences.
 
     Models drop, repeat or overshoot indices. Clamping is cheaper and more
-    predictable than retrying the call.
+    predictable than retrying the call. Oversized scenes (the model
+    ignoring "usually 2 to 5 sentences") are also split further here, since
+    a scene that's too long produces narration too long for reliable TTS.
     """
     fixed, cursor = [], 1
-
     for scene in sorted(raw, key=lambda s: s.start):
         if cursor > total:
             break
         start = cursor                       # always continue where we left off
         end = min(max(scene.end, start), total)
-        fixed.append(
-            Boundary(
-                start=start,
-                end=end,
-                image_prompt=scene.image_prompt,
-                mood=scene.mood,
-            )
+        fixed.extend(
+            Boundary(start=s, end=e, image_prompt=scene.image_prompt, mood=scene.mood)
+            for s, e in _cap_length(start, end)
         )
         cursor = end + 1
-
-    if cursor <= total and fixed:            # absorb anything the model forgot
-        last = fixed[-1]
-        fixed[-1] = Boundary(
-            start=last.start,
-            end=total,
-            image_prompt=last.image_prompt,
-            mood=last.mood,
+    if cursor <= total:
+        # absorb anything the model forgot, in scene-sized pieces too
+        image_prompt = fixed[-1].image_prompt if fixed else ""
+        mood = fixed[-1].mood if fixed else ""
+        fixed.extend(
+            Boundary(start=s, end=e, image_prompt=image_prompt, mood=mood)
+            for s, e in _cap_length(cursor, total)
         )
     return fixed
+
 
 
 def _scene_from(sentences: list[str], b: Boundary) -> Scene:

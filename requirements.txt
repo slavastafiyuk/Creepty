@@ -3,4 +3,12 @@ ollama>=0.4
 pydantic>=2.9
 requests>=2.32
 kokoro>=0.9.4
-soundfile
+soundfile~=0.14.0
+
+numpy~=2.5.3
+
+
+torch~=2.14.0
+parler_tts~=0.2.2
+transformers~=5.10.0
+num2words~=0.5.14
