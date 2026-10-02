@@ -1,10 +1,10 @@
-"""Generates narration audio locally through Parler-TTS.
+"""Generates narration locally through Qwen3-TTS CustomVoice.
 
-Runs on CPU, so it never competes with ComfyUI for VRAM. Unlike a plain
-TTS model, Parler-TTS is steered with a natural-language description of
-how the line should be delivered, so each scene's mood (mysterious,
-fearful, passionate, ...) is turned into a description and baked into
-the performance itself, not just a speed multiplier.
+Runs on CPU so ComfyUI can use the GPU simultaneously.
+
+The same predefined speaker is used for every scene, keeping one narrator
+throughout the entire video. Mood instructions change delivery/emotion
+without changing narrator identity.
 """
 
 import functools
@@ -15,205 +15,230 @@ import numpy as np
 import soundfile as sf
 import torch
 from num2words import num2words
-from parler_tts import ParlerTTSForConditionalGeneration
-from transformers import AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
+
+from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
+
 
 OUTPUT_DIR = Path(__file__).parent.parent / "output"
 
-# The multilingual checkpoint was trained on named speakers, which keeps
-# the narrator's voice identity consistent across scenes even as the
-# mood description changes.
-MODEL_NAME = "parler-tts/parler-tts-mini-multilingual-v1.1"
-SPEAKER = "Daniel"   # trained speaker name; swap for another trained voice
-DEVICE = "cpu" #"cuda:0" if torch.cuda.is_available() else "cpu"
-DESCRIPTION_MODEL_NAME = "google/flan-t5-large"  # this checkpoint's text_encoder
 
-# Straight-apostrophe / straight-quote normalization: Parler-TTS was
-# trained mostly on plain ASCII punctuation and mispronounces curly
-# quotes and other smart punctuation. Em/en dashes become a comma pause
-# rather than a literal dash, which TTS models handle far more reliably.
+# ---------------------------------------------------------------------------
+# Model configuration
+# ---------------------------------------------------------------------------
+
+MODEL_NAME = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+
+DEVICE = "cpu"
+DTYPE = torch.float32
+LANGUAGE = "English"
+
+# Fixed narrator for the entire video.
+# Ryan = native English male voice.
+SPEAKER = "Ryan"
+
+
+# ---------------------------------------------------------------------------
+# Text normalization
+# ---------------------------------------------------------------------------
+
 _NORMALIZE = str.maketrans({
-    "\u2018": "'", "\u2019": "'",   # ‘ ’
-    "\u201c": '"', "\u201d": '"',  # “ ”
-    "\u2013": ",", "\u2014": ",",  # – —
-    "\u2026": "...",               # …
+    "\u2018": "'",
+    "\u2019": "'",
+    "\u201c": '"',
+    "\u201d": '"',
+    "\u2013": ",",
+    "\u2014": ",",
+    "\u2026": "...",
 })
 
-# 4-digit numbers in this range read as spoken years ("two thousand",
-# "nineteen eighty-four") rather than as a plain cardinal number.
 _YEAR_RANGE = range(1000, 2100)
 _NUMBER_RE = re.compile(r"\d[\d,]*\.?\d*")
 
-# Parler-TTS caps out at 512 prompt tokens; past that it still generates
-# but the output degrades into skipped/repeated/garbled speech instead
-# of erroring. Stay well under that per chunk.
-MAX_PROMPT_TOKENS = 400
 
-# Fixed seed: keeps the narrator's tone stable across separate generate_voice
-# calls instead of drifting scene to scene.
-SEED = 42
+# ---------------------------------------------------------------------------
+# Voice style
+# ---------------------------------------------------------------------------
 
-# The DAC audio codec this model uses runs at 86 frames/second, so audio
-# tokens map to real seconds at that rate. The generation budget is sized
-# to the actual chunk length instead of a fixed cap, so short lines don't
-# waste time and long lines don't get cut off mid-sentence.
-FRAME_RATE = 86
-WORDS_PER_SECOND = 2.2       # conservative speech-rate estimate
-SECONDS_BUFFER = 6           # headroom for slow/dread deliveries, pauses
-ABSOLUTE_MAX_SECONDS = 90    # hard ceiling per chunk, safety net only
-
-# Fixed part of the description: identity + recording quality.
-BASE_VOICE = (
-    f"{SPEAKER}'s voice is deep and masculine. "
-    "The recording is very clear, high quality, very close up, "
-    "and has no background noise."
+BASE_STYLE = (
+    "Narrate like a professional cinematic horror storyteller. "
+    "Keep the voice natural, intimate and controlled. "
+    "Speak clearly with realistic pacing and natural pauses at punctuation. "
+    "The recording should feel close, clean and studio quality."
 )
 
-# Mood -> delivery instructions appended to BASE_VOICE. Add more moods here
-# as your stories need them; the key should match scene.mood exactly
-# (case-insensitive).
 MOOD_DESCRIPTIONS = {
     "mysterious": (
-        "He speaks slowly and quietly, with controlled intensity, "
+        "Speak slowly and quietly with controlled intensity, "
         "as if revealing a dangerous secret."
     ),
 
     "fear": (
-        "He speaks quickly with an unsteady, frightened voice. "
-        "His breathing becomes tense and his words occasionally catch."
+        "Sound frightened and increasingly uneasy. "
+        "Use restrained panic and tense breathing while remaining clear."
     ),
 
     "dread": (
-        "He speaks very slowly and quietly, with a heavy, ominous tone "
-        "and long pauses between important phrases."
+        "Speak slowly with a heavy ominous feeling. "
+        "Use deliberate pauses and restrained emotion."
     ),
 
     "passion": (
-        "He speaks with strong emotion and conviction, becoming more "
-        "intense as he continues."
+        "Speak with strong emotion and conviction, "
+        "gradually becoming more intense."
     ),
 
     "tense": (
-        "He speaks quickly and precisely, sounding nervous and under "
-        "constant pressure while trying to remain controlled."
+        "Speak slightly faster with nervous controlled energy, "
+        "as if something dangerous could happen at any moment."
     ),
 
     "calm": (
-        "He speaks at a natural, steady pace in a calm and controlled voice."
+        "Speak naturally at a steady pace with a calm, controlled delivery."
     ),
 }
+
 DEFAULT_MOOD = "calm"
 
 
+# ---------------------------------------------------------------------------
+# Cached model
+# ---------------------------------------------------------------------------
+
 @functools.cache
-def _model() -> PreTrainedModel:
-    # Loaded once per process and kept warm; CPU inference is slow enough
-    # that reloading per call would be very costly.
-    model = ParlerTTSForConditionalGeneration.from_pretrained(MODEL_NAME).to(DEVICE)
-    model.eval()  # disables dropout; without this, quality is worse and
-                  # non-deterministic even with a fixed seed
+def _model() -> Qwen3TTSModel:
+    model = Qwen3TTSModel.from_pretrained(
+        MODEL_NAME,
+        device_map=DEVICE,
+        dtype=DTYPE,
+    )
+
+    print("Qwen narrator:", SPEAKER)
+    print("Supported speakers:", model.get_supported_speakers())
+
     return model
 
 
-@functools.cache
-def _prompt_tokenizer() -> PreTrainedTokenizerBase:
-    return AutoTokenizer.from_pretrained(MODEL_NAME)
+# ---------------------------------------------------------------------------
+# Style instruction
+# ---------------------------------------------------------------------------
 
-
-@functools.cache
-def _description_tokenizer() -> PreTrainedTokenizerBase:
-    return AutoTokenizer.from_pretrained(DESCRIPTION_MODEL_NAME, legacy=False)
-
-
-def _build_description(mood: str) -> str:
+def _build_instruction(mood: str) -> str:
     key = (mood or "").strip().lower()
-    mood_text = MOOD_DESCRIPTIONS.get(key, MOOD_DESCRIPTIONS[DEFAULT_MOOD])
-    return f"{BASE_VOICE} {mood_text}"
 
+    mood_text = MOOD_DESCRIPTIONS.get(
+        key,
+        MOOD_DESCRIPTIONS[DEFAULT_MOOD],
+    )
+
+    return f"{BASE_STYLE} {mood_text}"
+
+
+# ---------------------------------------------------------------------------
+# Number normalization
+# ---------------------------------------------------------------------------
 
 def _expand_number(match: re.Match) -> str:
     digits = match.group(0).replace(",", "")
+
+    if digits.endswith("."):
+        number = digits[:-1]
+
+        if len(number) == 4 and int(number) in _YEAR_RANGE:
+            return num2words(int(number), to="year") + "."
+
+        return num2words(int(number)) + "."
+
     if "." in digits:
         return num2words(float(digits))
+
     value = int(digits)
+
     if len(digits) == 4 and value in _YEAR_RANGE:
         return num2words(value, to="year")
+
     return num2words(value)
 
 
 def _normalize(text: str) -> str:
     text = text.translate(_NORMALIZE)
-    # Hyphenated compounds ("near-miss") are frequently mispronounced;
-    # a space reads far more reliably without changing the meaning.
     text = re.sub(r"(?<=\w)-(?=\w)", " ", text)
-    # Bare digits ("2000") get spelled out; Parler-TTS doesn't expand
-    # numbers on its own and reads them inconsistently otherwise.
     text = _NUMBER_RE.sub(_expand_number, text)
+
     return text
 
 
-def _split_for_budget(text: str) -> list[str]:
-    """Breaks text into sentence-level chunks that fit MAX_PROMPT_TOKENS.
+# ---------------------------------------------------------------------------
+# Generation
+# ---------------------------------------------------------------------------
 
-    A rough word-count proxy for tokens is enough here: scenes are
-    already short, this only kicks in for the rare oversized one.
-    """
-    sentences = re.split(r"(?<=[.!?…])\s+", text.strip())
-    chunks, current, count = [], [], 0
-    for sentence in sentences:
-        tokens = len(sentence.split())
-        if count + tokens > MAX_PROMPT_TOKENS and current:
-            chunks.append(" ".join(current))
-            current, count = [], 0
-        current.append(sentence)
-        count += tokens
-    if current:
-        chunks.append(" ".join(current))
-    return chunks or [text]
+def _generate(
+    text: str,
+    mood: str,
+) -> tuple[np.ndarray, int]:
+
+    model = _model()
+    instruction = _build_instruction(mood)
+
+    with torch.inference_mode():
+        wavs, sample_rate = model.generate_custom_voice(
+            text=text,
+            language=LANGUAGE,
+            speaker=SPEAKER,
+            instruct=instruction,
+
+            # Keep some natural variation while preserving speaker identity.
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9,
+        )
+
+    audio = np.asarray(
+        wavs[0],
+        dtype=np.float32,
+    )
+
+    return audio, sample_rate
 
 
-def _max_new_tokens_for(word_count: int) -> int:
-    """Sizes the generation budget to the actual text instead of a fixed cap."""
-    estimated_seconds = word_count / WORDS_PER_SECOND + SECONDS_BUFFER
-    seconds = min(estimated_seconds, ABSOLUTE_MAX_SECONDS)
-    return int(seconds * FRAME_RATE)
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
+def generate_voice(
+    text: str,
+    name: str,
+    mood: str = DEFAULT_MOOD,
+) -> str:
 
-def generate_voice(text: str, name: str, mood: str = DEFAULT_MOOD) -> str:
-    """Renders text to speech and saves it as output/<name>.wav.
-
-    mood selects the delivery style via MOOD_DESCRIPTIONS - pass the
-    scene's own mood field so each scene gets its own performance.
-    """
     text = _normalize(text.strip())
+
     if not text:
         raise ValueError("Empty text.")
 
-    description = _build_description(mood)
-    model = _model()
-    desc = _description_tokenizer()(description, return_tensors="pt").to(DEVICE)
+    # One scene = one generation.
+    #
+    # Do NOT split sentences/chunks here:
+    # separate generations can create changes in prosody and audible seams.
+    audio, sample_rate = _generate(
+        text,
+        mood,
+    )
 
-    audio_chunks = []
-    for chunk in _split_for_budget(text):
-        prompt = _prompt_tokenizer()(chunk, return_tensors="pt").to(DEVICE)
-        target_tokens = _max_new_tokens_for(len(chunk.split()))
-
-        torch.manual_seed(SEED)
-        with torch.inference_mode():
-            generation = model.generate(
-                input_ids=desc.input_ids,
-                attention_mask=desc.attention_mask,
-                prompt_input_ids=prompt.input_ids,
-                prompt_attention_mask=prompt.attention_mask,
-                do_sample=True,
-                temperature=0.9,
-                max_new_tokens=target_tokens,
-            )
-        audio_chunks.append(generation.cpu().numpy().squeeze().astype(np.float32))
-
-    audio = np.concatenate(audio_chunks) if len(audio_chunks) > 1 else audio_chunks[0]
+    if audio.size == 0:
+        raise RuntimeError("No audio was generated.")
 
     path = OUTPUT_DIR / f"{name}.wav"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    sf.write(str(path), audio, model.config.sampling_rate)
+
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    sf.write(
+        str(path),
+        audio,
+        sample_rate,
+        subtype="PCM_16",
+    )
+
     return str(path)

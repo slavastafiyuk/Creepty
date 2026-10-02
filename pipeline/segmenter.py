@@ -28,7 +28,13 @@ DEFAULT_SYSTEM = (
     "Return scenes as ranges of sentence numbers, covering every sentence "
     "in order with no gaps and no overlaps. "
     "A scene is one continuous visual moment, usually 2 to 5 sentences. "
-    "Start a new scene when the place, the time or the subject changes. "
+    "Prefer keeping sentences from the same paragraph together. "
+    "Treat a paragraph break as a strong signal to start a new scene, "
+    "especially when it marks a new thought, moment or narrative beat. "
+    "Start a new scene when the place, the time, the subject or the "
+    "narrative moment changes. "
+    "Do not split a paragraph unnecessarily just to reach a certain "
+    "number of sentences. "
     "Write image_prompt and mood in English, whatever the story language."
 )
 
