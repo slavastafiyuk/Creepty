@@ -11,6 +11,7 @@ import json
 import random
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 import requests
@@ -27,6 +28,7 @@ STYLE = (
     "cinematic horror film still, dark atmosphere, film grain, "
     "dramatic low-key lighting, highly detailed"
 )
+CANCEL_TIMEOUT = 15
 TIMEOUT = 600   # seconds before giving up on one image
 
 CLIENT_ID = str(uuid.uuid4())
@@ -63,27 +65,53 @@ def is_available() -> bool:
         return False
 
 
-def interrupt():
-    """Stops whatever ComfyUI is currently rendering."""
-    try:
-        requests.post(f"{COMFY_URL}/interrupt", timeout=5)
-    except requests.RequestException:
-        pass
-
-
-def _wait(prompt_id: str) -> dict:
-    deadline = time.monotonic() + TIMEOUT
+def interrupt(prompt_id: str):
+    """Cancel this job only, including when it is still queued."""
+    response = requests.post(
+        f"{COMFY_URL}/api/jobs/{prompt_id}/cancel", timeout=5
+    )
+    response.raise_for_status()
+    deadline = time.monotonic() + CANCEL_TIMEOUT
     while time.monotonic() < deadline:
-        history = requests.get(
-            f"{COMFY_URL}/history/{prompt_id}", timeout=10
-        ).json()
-        if prompt_id in history:
-            entry = history[prompt_id]
-            if entry.get("status", {}).get("status_str") == "error":
-                raise RuntimeError("ComfyUI failed while generating the image.")
-            return entry["outputs"]
-        time.sleep(1)
-    raise TimeoutError("ComfyUI took too long to generate the image.")
+        response = requests.get(f"{COMFY_URL}/queue", timeout=5)
+        response.raise_for_status()
+        queue = response.json()
+        active = queue["queue_running"] + queue["queue_pending"]
+        if not any(job[1] == prompt_id for job in active):
+            return
+        time.sleep(0.25)
+    raise TimeoutError("ComfyUI did not confirm cancellation of this image.")
+
+
+def _wait(
+    prompt_id: str, cancelled: Callable[[], bool] | None = None
+) -> dict:
+    deadline = time.monotonic() + TIMEOUT
+    try:
+        while time.monotonic() < deadline:
+            if cancelled is not None and cancelled():
+                raise InterruptedError("Image generation cancelled.")
+            response = requests.get(
+                f"{COMFY_URL}/history/{prompt_id}", timeout=10
+            )
+            response.raise_for_status()
+            history = response.json()
+            if prompt_id in history:
+                entry = history[prompt_id]
+                if entry.get("status", {}).get("status_str") == "error":
+                    raise RuntimeError("ComfyUI failed while generating the image.")
+                return entry["outputs"]
+            time.sleep(1)
+        raise TimeoutError("ComfyUI took too long to generate the image.")
+    except Exception as error:
+        # A submitted job belongs to us even if polling fails.
+        try:
+            interrupt(prompt_id)
+        except Exception as cleanup_error:
+            raise RuntimeError(
+                f"{error} Could not confirm image cancellation: {cleanup_error}"
+            ) from error
+        raise
 
 
 def _first_image(outputs: dict) -> dict:
@@ -98,7 +126,10 @@ def _first_image(outputs: dict) -> dict:
     raise RuntimeError("ComfyUI returned no image.")
 
 
-def generate_image(prompt: str, name: str, seed: int | None = None) -> str:
+def generate_image(
+    prompt: str, name: str, seed: int | None = None,
+    *, cancelled: Callable[[], bool] | None = None,
+) -> str:
     """Renders one image and saves it as output/<name>.png."""
     workflow = _build(
         prompt, seed if seed is not None else random.getrandbits(32)
@@ -112,10 +143,12 @@ def generate_image(prompt: str, name: str, seed: int | None = None) -> str:
     if response.status_code != 200:
         raise RuntimeError(f"ComfyUI rejected the workflow: {response.text}")
 
-    outputs = _wait(response.json()["prompt_id"])
-    data = requests.get(
+    outputs = _wait(response.json()["prompt_id"], cancelled)
+    response = requests.get(
         f"{COMFY_URL}/view", params=_first_image(outputs), timeout=60
-    ).content
+    )
+    response.raise_for_status()
+    data = response.content
 
     path = OUTPUT_DIR / f"{name}.png"
     path.parent.mkdir(parents=True, exist_ok=True)

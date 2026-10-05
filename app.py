@@ -1,22 +1,22 @@
 import ctypes
 import sys
-import time
-import uuid
-from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QThread, Qt, QUrl, Signal
+from PySide6.QtCore import QObject, QThread, QTimer, Qt, QUrl, Slot
 from PySide6.QtGui import QPixmap, QIcon
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QFormLayout, QFrame, QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QMainWindow, QProgressBar, QPushButton,
+    QHeaderView, QLabel, QLineEdit, QMainWindow, QProgressBar, QPushButton, QFileDialog,
     QSplitter, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
 )
 
-from pipeline import comfy_server, images, voice
+from pipeline import comfy_server
+from pipeline.project import Project, load_project, save_project
+from pipeline.scenes import edit_scene, has_asset
+from pipeline.workers import AssetWorker, Generator, can_render_image, can_render_voice, new_run_id
 from pipeline.segmenter import (
-    DEFAULT_SYSTEM, Scene, split_sentences, stream_story,
+    DEFAULT_SYSTEM, Scene, split_sentences,
 )
 
 PREVIEW_CHARS = 70
@@ -34,212 +34,6 @@ def resource_path(name: str) -> str:
 ICON_PATH = resource_path("resources/images/icons/creepty_ico.ico")
 
 
-# ---------- shared pipeline helpers ----------
-
-def new_run_id() -> str:
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
-
-
-def build_image_prompt(scene: Scene) -> str:
-    """Structured prompt: the Qwen3 text encoder reads labelled fields."""
-    lines = [
-        f"context: {scene.text.strip()}",
-        f"image: {scene.image_prompt.strip()}",
-    ]
-    if scene.mood.strip():
-        lines.append(f"mood: {scene.mood.strip()}")
-    return "\n".join(lines)
-
-
-def asset_name(run_id: str, row: int) -> str:
-    # The suffix keeps every render unique, so a moved or regenerated scene
-    # never points at a file that belongs to another scene.
-    return f"{run_id}/scene_{row + 1:03d}_{uuid.uuid4().hex[:6]}"
-
-
-def can_render_image(scene: Scene) -> bool:
-    return bool(scene.text.strip() and scene.image_prompt.strip())
-
-
-def can_render_voice(scene: Scene) -> bool:
-    return bool(scene.text.strip())
-
-
-# ---------- workers ----------
-
-class Generator(QObject):
-    """Runs the whole pipeline off the UI thread: scenes, images, voice."""
-
-    progress = Signal(str)                      # splitting / startup status
-    image_progress = Signal(str)                # image-stream status
-    voice_progress = Signal(str)                # voice-stream status
-    scenes_ready = Signal(int, list)             # batch index, scenes
-    asset_done = Signal(int, str, str, float)    # row, kind, path, seconds
-    finished = Signal(str)
-    failed = Signal(str)
-
-    def __init__(self, story: str, prompt: str, run_id: str):
-        super().__init__()
-        self.story = story
-        self.prompt = prompt
-        self.run_id = run_id
-        self.scenes: list[Scene] = []
-        self.cancelled = False
-
-    def cancel(self):
-        """Checked between steps; also stops the image being rendered."""
-        self.cancelled = True
-        images.interrupt()
-
-    def run(self):
-        try:
-            self.progress.emit("Splitting scenes...")
-            for index, total, scenes in stream_story(self.story, self.prompt):
-                if self.cancelled:
-                    self.finished.emit("Cancelled.")
-                    return
-                self.progress.emit(f"Splitting scenes (batch {index} of {total})...")
-                self.scenes.extend(scenes)
-                self.scenes_ready.emit(index, scenes)
-
-            if self.cancelled:
-                self.finished.emit("Cancelled.")
-                return
-
-            self.progress.emit("Starting ComfyUI...")
-            if not comfy_server.start():
-                self.failed.emit(
-                    f"Couldn't start ComfyUI in {comfy_server.COMFY_DIR}."
-                )
-                return
-
-            self.generate_assets()
-            self.finished.emit("Cancelled." if self.cancelled else "Done.")
-        except Exception as error:
-            self.failed.emit(f"Failed: {error}")
-
-    def generate_assets(self):
-        """Images (GPU, via ComfyUI's HTTP API) and voice (GPU, local
-        Parler-TTS) run one after the other, since both compete for the
-        same limited VRAM. Each stream still processes its own scenes in
-        order and reports its own status independently."""
-        image_rows = [
-            row for row, scene in enumerate(self.scenes)
-            if can_render_image(scene)
-        ]
-        voice_rows = [
-            row for row, scene in enumerate(self.scenes)
-            if can_render_voice(scene)
-        ]
-
-        total = len(image_rows)
-        for index, row in enumerate(image_rows, start=1):
-            if self.cancelled:
-                return
-            self.image_progress.emit(f"{index} of {total} (scene {row + 1})")
-            start = time.monotonic()
-            path = images.generate_image(
-                build_image_prompt(self.scenes[row]), asset_name(self.run_id, row)
-            )
-            self.asset_done.emit(row, "image", path, time.monotonic() - start)
-        if total:
-            self.image_progress.emit("done")
-
-        total = len(voice_rows)
-        for index, row in enumerate(voice_rows, start=1):
-            if self.cancelled:
-                return
-            self.voice_progress.emit(f"{index} of {total} (scene {row + 1})")
-            start = time.monotonic()
-            path = voice.generate_voice(
-                self.scenes[row].text, asset_name(self.run_id, row),
-                mood=self.scenes[row].mood,
-            )
-            self.asset_done.emit(row, "audio", path, time.monotonic() - start)
-        if total:
-            self.voice_progress.emit("done")
-
-
-class AssetWorker(QObject):
-    """Renders images and/or voice for specific scenes, using their current
-    edited state. Images and voice run one after the other, since both
-    compete for the same limited VRAM. Either job list may be empty, so
-    this also covers a single-scene regen of just one asset kind. Each
-    stream reports its own status independently, so both are folded into
-    the same status line."""
-
-    progress = Signal(str)                       # startup status only
-    image_progress = Signal(str)
-    voice_progress = Signal(str)
-    asset_done = Signal(int, str, str, float)     # row, kind, path, seconds
-    finished = Signal(str)
-    failed = Signal(str)
-
-    def __init__(
-        self,
-        image_jobs: list[tuple[int, Scene]],
-        voice_jobs: list[tuple[int, Scene]],
-        run_id: str,
-    ):
-        super().__init__()
-        self.image_jobs = image_jobs
-        self.voice_jobs = voice_jobs
-        self.run_id = run_id
-        self.cancelled = False
-
-    def cancel(self):
-        """Checked between items in each stream; also stops the image
-        currently being rendered."""
-        self.cancelled = True
-        images.interrupt()
-
-    def _run_images(self):
-        total = len(self.image_jobs)
-        for index, (row, scene) in enumerate(self.image_jobs, start=1):
-            if self.cancelled:
-                return
-            self.image_progress.emit(f"{index} of {total} (scene {row + 1})")
-            start = time.monotonic()
-            path = images.generate_image(
-                build_image_prompt(scene), asset_name(self.run_id, row)
-            )
-            self.asset_done.emit(row, "image", path, time.monotonic() - start)
-        if total:
-            self.image_progress.emit("done")
-
-    def _run_voices(self):
-        total = len(self.voice_jobs)
-        for index, (row, scene) in enumerate(self.voice_jobs, start=1):
-            if self.cancelled:
-                return
-            self.voice_progress.emit(f"{index} of {total} (scene {row + 1})")
-            start = time.monotonic()
-            path = voice.generate_voice(
-                scene.text, asset_name(self.run_id, row), mood=scene.mood
-            )
-            self.asset_done.emit(row, "audio", path, time.monotonic() - start)
-        if total:
-            self.voice_progress.emit("done")
-
-    def run(self):
-        try:
-            if self.image_jobs:
-                self.progress.emit("Starting ComfyUI...")
-                if not comfy_server.start():
-                    self.failed.emit(
-                        f"Couldn't start ComfyUI in {comfy_server.COMFY_DIR}."
-                    )
-                    return
-                self._run_images()
-
-            if self.voice_jobs:
-                self._run_voices()
-
-            self.finished.emit("Cancelled." if self.cancelled else "Done.")
-        except Exception as error:
-            self.failed.emit(f"Failed: {error}")
-
-
 # ---------- window ----------
 
 class Window(QMainWindow):
@@ -248,6 +42,8 @@ class Window(QMainWindow):
         # Keep references alive: a local QThread gets collected mid-run.
         self.worker = None
         self.thread = None
+        self._closing = False
+        self.project_path: Path | None = None
 
         # The list is the source of truth; the table is only a view of it.
         self.scenes: list[Scene] = []
@@ -272,13 +68,19 @@ class Window(QMainWindow):
         self._voice_text = ""
 
         # One player for the whole window; the output must stay referenced.
-        self.player = QMediaPlayer()
-        self.audio_output = QAudioOutput()
+        self.player = QMediaPlayer(self)
+        self.audio_output = QAudioOutput(self)
         self.player.setAudioOutput(self.audio_output)
 
         self.setWindowTitle("Creepty")
         self.resize(1200, 880)
         self.setCentralWidget(self._build())
+        self.autosave_timer = QTimer(self)
+        self.autosave_timer.setSingleShot(True)
+        self.autosave_timer.setInterval(500)
+        self.autosave_timer.timeout.connect(self.autosave)
+        self.story.textChanged.connect(self.schedule_save)
+        self.prompt.textChanged.connect(self.schedule_save)
         self.set_busy(False)
         self.update_progress()
 
@@ -316,6 +118,10 @@ class Window(QMainWindow):
     def _action_row(self) -> QHBoxLayout:
         self.button = QPushButton("Generate")
         self.button.clicked.connect(self.generate)
+        self.open_button = QPushButton("Open project")
+        self.open_button.clicked.connect(self.open_project)
+        self.save_button = QPushButton("Save project as...")
+        self.save_button.clicked.connect(self.save_project_as)
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.clicked.connect(self.cancel)
         self.reset = QPushButton("Reset prompt")
@@ -338,6 +144,8 @@ class Window(QMainWindow):
         self.eta.setStyleSheet("color: #888;")
 
         row = QHBoxLayout()
+        row.addWidget(self.open_button)
+        row.addWidget(self.save_button)
         row.addWidget(self.button)
         row.addWidget(self.cancel_button)
         row.addWidget(self.reset)
@@ -357,7 +165,7 @@ class Window(QMainWindow):
     def _scene_list(self) -> QWidget:
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(
-            ["#", "Scene", "Mood", "~Time", "Assets"]
+            ["#", "Scene", "Mood", "Time", "Assets"]
         )
         self.table.verticalHeader().setVisible(False)
         # Read-only and single-line: long text never blows up a row.
@@ -418,6 +226,7 @@ class Window(QMainWindow):
         self.detail_image = QTextEdit()
         self.detail_image.setMaximumHeight(80)
         self.detail_mood = QLineEdit()
+        self.detail_mood.setPlaceholderText("mysterious, fear, dread, passion, tense, calm")
 
         for widget in (self.detail_text, self.detail_image, self.detail_mood):
             widget.setEnabled(False)
@@ -488,6 +297,7 @@ class Window(QMainWindow):
         for widget in (
             self.insert_button, self.delete_button, self.split_button,
             self.up_button, self.down_button, self.missing_button,
+            self.open_button, self.reset, self.story, self.prompt,
         ):
             widget.setEnabled(not busy)
         self.refresh_detail_buttons()
@@ -495,6 +305,8 @@ class Window(QMainWindow):
     def refresh_detail_buttons(self):
         selected = 0 <= self.current < len(self.scenes)
         scene = self.scenes[self.current] if selected else None
+        for widget in (self.detail_text, self.detail_image, self.detail_mood):
+            widget.setEnabled(selected and not self.busy)
         self.image_button.setEnabled(
             selected and not self.busy and can_render_image(scene)
         )
@@ -504,6 +316,7 @@ class Window(QMainWindow):
 
     # ---------- status line ----------
 
+    @Slot(str)
     def set_stage(self, text: str):
         """A one-off stage message (splitting, starting ComfyUI). Once the
         asset streams start reporting, their combined line takes over."""
@@ -512,10 +325,12 @@ class Window(QMainWindow):
         self._voice_text = ""
         self.status.setText(text)
 
+    @Slot(str)
     def set_image_status(self, text: str):
         self._image_text = text
         self._refresh_asset_line()
 
+    @Slot(str)
     def set_voice_status(self, text: str):
         self._voice_text = text
         self._refresh_asset_line()
@@ -546,8 +361,8 @@ class Window(QMainWindow):
         if not total:
             return
 
-        images_done = sum(bool(scene.image_path) for scene in self.scenes)
-        voices_done = sum(bool(scene.audio_path) for scene in self.scenes)
+        images_done = sum(has_asset(scene, "image") for scene in self.scenes)
+        voices_done = sum(has_asset(scene, "audio") for scene in self.scenes)
         done = images_done + voices_done
 
         self.progress_bar.setRange(0, total)
@@ -624,7 +439,7 @@ class Window(QMainWindow):
             self.thumbnail.setPixmap(QPixmap())
             self.thumbnail.setText("No image yet")
 
-        has_audio = bool(scene.audio_path)
+        has_audio = has_asset(scene, "audio")
         self.audio_label.setText(
             scene.audio_path if has_audio else "No audio yet"
         )
@@ -646,13 +461,14 @@ class Window(QMainWindow):
         flat = " ".join(text.split())
         return flat if len(flat) <= PREVIEW_CHARS else flat[:PREVIEW_CHARS] + "…"
 
-    def duration(self, text: str) -> str:
-        seconds = round(len(text.split()) / WORDS_PER_MINUTE * 60)
-        return f"{seconds // 60}:{seconds % 60:02d}"
+    def duration(self, scene: Scene) -> str:
+        measured = scene.audio_duration if has_asset(scene, "audio") else None
+        seconds = round(measured if measured is not None else len(scene.text.split()) / WORDS_PER_MINUTE * 60)
+        return f"{'' if measured is not None else '~'}{seconds // 60}:{seconds % 60:02d}"
 
     def assets(self, scene: Scene) -> str:
-        image = "IMG" if scene.image_path else "·"
-        audio = "SND" if scene.audio_path else "·"
+        image = "IMG" if has_asset(scene, "image") else "·"
+        audio = "SND" if has_asset(scene, "audio") else "·"
         return f"{image} {audio}"
 
     def refresh_row(self, row: int):
@@ -662,7 +478,7 @@ class Window(QMainWindow):
                 str(row + 1),
                 self.preview(scene.text) or "(empty)",
                 scene.mood,
-                self.duration(scene.text),
+                self.duration(scene),
                 self.assets(scene),
             ]
         ):
@@ -678,20 +494,20 @@ class Window(QMainWindow):
         self.table.blockSignals(False)
         if 0 <= keep_row < len(self.scenes):
             self.table.selectRow(keep_row)
-        else:
-            self.load_detail()
+        self.load_detail()
         self.update_progress()
 
     # ---------- detail panel ----------
 
     def load_detail(self):
+        self.player.stop()
         rows = self.table.selectionModel().selectedRows()
         self.current = rows[0].row() if rows else -1
         enabled = 0 <= self.current < len(self.scenes)
 
         self.loading = True
         for widget in (self.detail_text, self.detail_image, self.detail_mood):
-            widget.setEnabled(enabled)
+            widget.setEnabled(enabled and not self.busy)
 
         if enabled:
             scene = self.scenes[self.current]
@@ -708,16 +524,17 @@ class Window(QMainWindow):
         self.refresh_detail_buttons()
 
     def save_detail(self):
-        if self.loading or self.current < 0:
+        if self.loading or self.busy or self.current < 0:
             return
         scene = self.scenes[self.current]
-        self.scenes[self.current] = Scene(
-            text=self.detail_text.toPlainText(),
+        self.scenes[self.current] = edit_scene(
+            scene, text=self.detail_text.toPlainText(),
             image_prompt=self.detail_image.toPlainText(),
             mood=self.detail_mood.text(),
-            image_path=scene.image_path,   # editing text keeps the assets
-            audio_path=scene.audio_path,
         )
+        self.player.stop()
+        self.load_previews(self.scenes[self.current])
+        self.schedule_save()
         self.table.blockSignals(True)
         self.refresh_row(self.current)
         self.table.blockSignals(False)
@@ -726,21 +543,29 @@ class Window(QMainWindow):
 
     # ---------- scene operations ----------
 
+    @Slot(int, list)
     def show_scenes(self, batch_index: int, scenes: list[Scene]):
-        # A capacity retry restarts from batch 1, so clear instead of appending.
+        # Batch 1 starts a new story; retries resume only unfinished text.
         if batch_index == 1:
             self.scenes = []
         self.scenes.extend(scenes)
         self.segmenting = False   # scenes exist now, the bar can go determinate
         self.refresh_table()
         self.table.scrollToBottom()
+        self.autosave()
 
-    def asset_ready(self, row: int, kind: str, path: str, seconds: float):
-        if not 0 <= row < len(self.scenes):
-            return
-        self.scenes[row] = self.scenes[row].model_copy(
-            update={f"{kind}_path": path}
-        )
+    @Slot(str, int, str, str, float, float)
+    def asset_ready(self, scene_id: str, revision: int, kind: str, path: str,
+                    seconds: float, duration: float):
+        row = next((i for i, scene in enumerate(self.scenes)
+                    if scene.id == scene_id and scene.revision == revision), None)
+        if row is None or kind not in ("image", "audio"):
+            return  # A late result must never attach to revised or replaced text.
+        updates = {f"{kind}_path": path}
+        if kind == "audio":
+            updates["audio_duration"] = duration
+        self.scenes[row] = self.scenes[row].model_copy(update=updates)
+        self.autosave()
         (self.image_times if kind == "image" else self.voice_times).append(seconds)
         self.table.blockSignals(True)
         self.refresh_row(row)
@@ -751,20 +576,28 @@ class Window(QMainWindow):
 
     def insert_scene(self):
         """Adds an empty scene after the selection, or at the end."""
+        if self.busy or self._closing:
+            return
         row = self.current + 1 if self.current >= 0 else len(self.scenes)
         self.scenes.insert(row, Scene(text="", image_prompt="", mood=""))
+        self.schedule_save()
         self.refresh_table(keep_row=row)
         self.detail_text.setFocus()
 
     def delete_scene(self):
+        if self.busy or self._closing:
+            return
         if self.current < 0:
             return
         row = self.current
         del self.scenes[row]
+        self.schedule_save()
         self.refresh_table(keep_row=min(row, len(self.scenes) - 1))
 
     def split_scene(self):
         """Breaks the selected scene in two at its midpoint sentence."""
+        if self.busy or self._closing:
+            return
         if self.current < 0:
             self.status.setText("Select a scene to split.")
             return
@@ -789,9 +622,12 @@ class Window(QMainWindow):
                 mood=scene.mood,
             ),
         )
+        self.schedule_save()
         self.refresh_table(keep_row=row + 1)
 
     def move_scene(self, offset: int):
+        if self.busy or self._closing:
+            return
         if self.current < 0:
             return
         target = self.current + offset
@@ -801,35 +637,41 @@ class Window(QMainWindow):
         self.scenes[row], self.scenes[target] = (
             self.scenes[target], self.scenes[row],
         )
+        self.schedule_save()
         self.refresh_table(keep_row=target)
 
     # ---------- running workers ----------
 
     def start_worker(self, worker: QObject):
         """Wires the signals every worker shares and starts it on a thread."""
+        if self.thread is not None or self._closing:
+            return
         self.set_busy(True)
         self._stage_text = ""
         self._image_text = ""
         self._voice_text = ""
         self.status.setText("")
 
-        self.thread = QThread()
+        self.thread = QThread(self)
         self.worker = worker
         self.worker.moveToThread(self.thread)
 
-        self.thread.started.connect(self.worker.run)
+        self.thread.started.connect(self.worker.run, Qt.ConnectionType.DirectConnection)
         self.worker.progress.connect(self.set_stage)
         self.worker.image_progress.connect(self.set_image_status)
         self.worker.voice_progress.connect(self.set_voice_status)
         self.worker.asset_done.connect(self.asset_ready)
         self.worker.finished.connect(self.status.setText)
         self.worker.failed.connect(self.status.setText)
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.failed.connect(self.thread.quit)
+        self.worker.finished.connect(self.thread.quit, Qt.ConnectionType.DirectConnection)
+        self.worker.failed.connect(self.thread.quit, Qt.ConnectionType.DirectConnection)
+        self.thread.finished.connect(self.worker.deleteLater)
         self.thread.finished.connect(self.generation_over)
         self.thread.start()
 
     def generate(self):
+        if self.busy or self._closing:
+            return
         story = self.story.toPlainText().strip()
         prompt = self.prompt.toPlainText().strip()
         if not story:
@@ -839,11 +681,22 @@ class Window(QMainWindow):
             self.status.setText("The prompt can't be empty.")
             return
 
+        if not self.autosave():
+            return
+        run_id = new_run_id()
+        target = Path(__file__).parent / "output" / run_id / "project.json"
+        try:
+            save_project(target, Project(run_id=run_id, story=story, system_prompt=prompt))
+        except (OSError, ValueError) as error:
+            self.status.setText(f"New project could not be saved: {error}")
+            return
+        self.player.stop()
         self.scenes = []
+        self.project_path = target
         self.image_times = []
         self.voice_times = []
         self.segmenting = True
-        self.run_id = new_run_id()
+        self.run_id = run_id
         self.refresh_table()
 
         worker = Generator(story, prompt, self.run_id)
@@ -853,13 +706,15 @@ class Window(QMainWindow):
     def run_assets(self, image_rows: list[int], voice_rows: list[int]):
         """Renders the given rows' images and/or voice. Both streams run
         one after the other on the one worker."""
+        if self.busy or self._closing:
+            return
         image_jobs = [(row, self.scenes[row]) for row in image_rows]
         voice_jobs = [(row, self.scenes[row]) for row in voice_rows]
         if not image_jobs and not voice_jobs:
             self.status.setText("No scenes to render.")
             return
-        if self.run_id is None:
-            self.run_id = new_run_id()
+        if not self.autosave():
+            return
         self.start_worker(AssetWorker(image_jobs, voice_jobs, self.run_id))
 
     def generate_current_image(self):
@@ -875,14 +730,15 @@ class Window(QMainWindow):
         voice run one after the other."""
         rows_without_image = [
             row for row, scene in enumerate(self.scenes)
-            if not scene.image_path and can_render_image(scene)
+            if not has_asset(scene, "image") and can_render_image(scene)
         ]
         rows_without_audio = [
             row for row, scene in enumerate(self.scenes)
-            if not scene.audio_path and can_render_voice(scene)
+            if not has_asset(scene, "audio") and can_render_voice(scene)
         ]
         if not rows_without_image and not rows_without_audio:
-            self.status.setText("All assets are complete.")
+            complete = self.scenes and all(has_asset(scene, kind) for scene in self.scenes for kind in ("image", "audio"))
+            self.status.setText("All assets are complete." if complete else "Add narration text and image prompts to render missing assets.")
             return
         self.run_assets(rows_without_image, rows_without_audio)
 
@@ -892,10 +748,109 @@ class Window(QMainWindow):
             self.status.setText("Cancelling after the current step...")
             self.cancel_button.setEnabled(False)
 
+    @Slot()
     def generation_over(self):
+        thread = self.thread
+        if thread is None:
+            return
+        # finished can arrive before native thread-local cleanup has completed.
+        # Never join a live thread while the GUI holds Python's GIL.
+        if not thread.wait(0):
+            QTimer.singleShot(10, self.generation_over)
+            return
+        self.worker = None
+        self.thread = None
+        thread.deleteLater()
         self.segmenting = False
-        self.set_busy(False)
+        self.set_busy(self._closing)
         self.update_progress()
+        self.autosave()
+        if self._closing:
+            QTimer.singleShot(0, self.close)
+
+    # ---------- project persistence and shutdown ----------
+
+    def schedule_save(self):
+        if not self.loading:
+            self.autosave_timer.start()
+
+    def project(self) -> Project:
+        if self.run_id is None:
+            self.run_id = new_run_id()
+        return Project(run_id=self.run_id, story=self.story.toPlainText(),
+                       system_prompt=self.prompt.toPlainText(), scenes=self.scenes)
+
+    def autosave(self) -> bool:
+        self.autosave_timer.stop()
+        if not self.scenes and not self.story.toPlainText().strip() and self.run_id is None:
+            return True
+        try:
+            project = self.project()
+            if self.project_path is None:
+                self.project_path = Path(__file__).parent / "output" / project.run_id / "project.json"
+            save_project(self.project_path, project)
+            return True
+        except (OSError, ValueError) as error:
+            self.status.setText(f"Project could not be saved: {error}")
+            return False
+
+    def save_project_as(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save project", str(self.project_path or "project.json"), "Creepty project (*.json)")
+        if not path:
+            return
+        try:
+            target = Path(path)
+            save_project(target, self.project())
+            self.project_path = target.resolve()
+            self.autosave_timer.stop()
+            self.status.setText(f"Project saved: {self.project_path}")
+        except (OSError, ValueError) as error:
+            self.status.setText(f"Project could not be saved: {error}")
+
+    def open_project(self):
+        if self.busy or self._closing:
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Open project", str(Path(__file__).parent / "output"), "Creepty project (*.json)")
+        if not path or not self.autosave():
+            return
+        try:
+            project, warnings = load_project(Path(path))
+        except (OSError, ValueError) as error:
+            self.status.setText(f"Project could not be opened: {error}")
+            return
+        self.player.stop()
+        self.loading = True
+        self.story.setPlainText(project.story)
+        self.prompt.setPlainText(project.system_prompt)
+        self.loading = False
+        self.run_id = project.run_id
+        self.project_path = Path(path).resolve()
+        self.scenes = project.scenes
+        self.image_times, self.voice_times = [], []
+        self.refresh_table(keep_row=0)
+        message = f"Project opened: {self.project_path}"
+        if warnings:
+            message += f"; {len(warnings)} missing or invalid assets marked for regeneration."
+        self.status.setText(message)
+        self.status.setToolTip("\n".join(warnings))
+
+    def closeEvent(self, event):
+        self.player.stop()
+        if self.thread is not None:
+            event.ignore()
+            self._closing = True
+            self.cancel()
+            self.set_busy(True)
+            self.save_button.setEnabled(False)
+            self.status.setText("Closing after the current step and GPU cleanup...")
+            return
+        if not self.autosave():
+            event.ignore()
+            self._closing = False
+            self.set_busy(False)
+            self.save_button.setEnabled(True)
+            return
+        event.accept()
 
 
 if __name__ == "__main__":
