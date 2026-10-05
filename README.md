@@ -4,6 +4,8 @@ Creepty is a local desktop application for turning horror stories into scenes, i
 
 Editable projects can be saved and reopened. AI video generation, video assembly, and publishing are not implemented yet.
 
+![img.png](resources/images/Creepty.png)
+
 ## Current stack
 
 | Component | Implementation |
