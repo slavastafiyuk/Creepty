@@ -6,7 +6,7 @@ Creepty is a fully local AI desktop application that transforms written stories 
 
 All AI inference runs locally using Ollama, ComfyUI and Qwen3-TTS — no external AI APIs required.
 
-![img.png](resources/images/Creepty.png)
+![Creepty desktop application](resources/images/Creepty.png)
 
 ## Key Features
 
@@ -21,19 +21,20 @@ All AI inference runs locally using Ollama, ComfyUI and Qwen3-TTS — no externa
 
 ## Architecture
 
-Story  
-↓  
-Ollama / Gemma  
-↓  
-Scene Planning  
-↓  
-ComfyUI / FLUX  
-↓  
-Images  
-↓  
-Qwen3-TTS  
-↓  
-Narrated Project
+```mermaid
+flowchart TD
+    A[Story] --> B[Ollama / Gemma]
+    B --> C[Scene Planning]
+
+    C --> D[ComfyUI / FLUX]
+    C --> E[Qwen3-TTS]
+
+    D --> F[Generated Images]
+    E --> G[Narration Audio]
+
+    F --> H[Editable Creepty Project]
+    G --> H
+```
 
 ## Current stack
 
@@ -126,7 +127,7 @@ The pipeline runs in a worker thread to keep the interface responsive. Models us
 
 Before a new story or narration batch, the application releases models from the previous phase. If Creepty started ComfyUI, it stops that process when switching phases. An externally started ComfyUI instance remains running: Creepty requires an idle queue, requests model unloading through `/free`, and checks memory availability before continuing. Keep that instance idle from other clients while Creepty is generating content.
 
-Narration keeps your FP32 waveform decoder fix while the main model stays in BF16. Before publishing a WAV, Creepty checks for finite samples, at least 0.1 seconds of audio, a meaningful non-flat signal, and amplitudes outside the PCM range. Invalid generated signals get one retry; repeated failure is reported instead of saving a silent track. WAVs are written atomically and checked after PCM encoding. These checks do not establish intelligibility or artistic quality. Number normalization preserves commas and sentence punctuation, handles grouped numbers, ranges, and decimal digits, and expands clock times.
+Narration keeps the FP32 waveform decoder fix while the main model stays in BF16. Before publishing a WAV, Creepty checks for finite samples, at least 0.1 seconds of audio, a meaningful non-flat signal, and amplitudes outside the PCM range. Invalid generated signals get one retry; repeated failure is reported instead of saving a silent track. WAVs are written atomically and checked after PCM encoding. These checks do not establish intelligibility or artistic quality. Number normalization preserves commas and sentence punctuation, handles grouped numbers, ranges, and decimal digits, and expands clock times.
 
 Qwen reuses complete local model snapshots to avoid repeated metadata requests. Incomplete cached downloads are completed before loading the model.
 
