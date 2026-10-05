@@ -1,8 +1,35 @@
 # Creepty
 
-Creepty is a local desktop application for turning horror stories into scenes, images, and narration. It provides an editable scene list, image previews, audio playback, and regeneration of individual assets.
+Creepty is a fully local AI desktop application that transforms written stories into editable visual scenes with generated images and narration.
 
-Editable projects can be saved and reopened. AI video generation, video assembly, and publishing are not implemented yet.
+All AI inference runs locally using Ollama, ComfyUI and Qwen3-TTS — no external AI APIs required.
+
+## Key Features
+
+- Fully local AI inference
+- Automatic LLM-based scene segmentation
+- AI image generation with ComfyUI
+- Local narration with Qwen3-TTS
+- Editable and persistent projects
+- GPU/VRAM-aware model orchestration
+- Cancellation, retries and error recovery
+- Regression tests and benchmarking tools
+
+## Architecture
+
+Story  
+↓  
+Ollama / Gemma  
+↓  
+Scene Planning  
+↓  
+ComfyUI / FLUX  
+↓  
+Images  
+↓  
+Qwen3-TTS  
+↓  
+Narrated Project
 
 ## Current stack
 
