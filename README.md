@@ -4,6 +4,8 @@ Creepty is a fully local AI desktop application that transforms written stories 
 
 All AI inference runs locally using Ollama, ComfyUI and Qwen3-TTS — no external AI APIs required.
 
+![img.png](resources/images/Creepty.png)
+
 ## Key Features
 
 - Fully local AI inference
@@ -30,8 +32,6 @@ Images
 Qwen3-TTS  
 ↓  
 Narrated Project
-
-![img.png](resources/images/Creepty.png)
 
 ## Current stack
 
