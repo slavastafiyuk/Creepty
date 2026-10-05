@@ -1,5 +1,7 @@
 # Creepty
 
+![CI](https://github.com/slavastafiyuk/Creepty/actions/workflows/tests.yml/badge.svg)
+
 Creepty is a fully local AI desktop application that transforms written stories into editable visual scenes with generated images and narration.
 
 All AI inference runs locally using Ollama, ComfyUI and Qwen3-TTS — no external AI APIs required.
