@@ -230,3 +230,7 @@ The regression tests use mocked services and model loading, real temporary media
 An earlier GPU implementation was also validated on 4 October 2026 with a complete generation, image regeneration, and voice regeneration. The run confirmed CUDA/BF16/SDPA narration, 768 × 1344 images, valid 24 kHz WAV files, and model cleanup between phases.
 
 Local benchmark reports and samples are stored in `output/benchmarks/`; implementation validation reports and samples are in `output/validation/`. The entire `output/` directory is ignored by Git, so these artifacts are not included in a fresh checkout. Timings are specific to the tested machine and workload.
+
+## License
+
+This project is licensed under the Apache License 2.0. See the [LICENSE](LICENSE) file for details.
