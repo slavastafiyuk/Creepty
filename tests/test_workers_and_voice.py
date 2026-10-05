@@ -13,11 +13,13 @@ class WorkerTests(unittest.TestCase):
     def setUp(self):
         self.events = []
         self.scene = Scene(text="Someone is here.", image_prompt="A dark door", mood="dread")
+
         def record(name, result=None):
             def run(*args, **kwargs):
                 self.events.append(name)
                 return result
             return run
+
         self.unload = self.enterContext(patch.object(voice, "unload_model", side_effect=record("voice_free")))
         self.enterContext(patch.object(app, "unload_scenes", side_effect=record("gemma_free")))
         self.start = self.enterContext(patch.object(app.comfy_server, "start", side_effect=record("image_start", True)))
@@ -72,8 +74,10 @@ class WorkerTests(unittest.TestCase):
                 yield 1, 1, [self.scene]
             finally:
                 self.events.append("plan_free")
+
         with patch.object(app, "stream_story", side_effect=stream):
             self.run_worker(app.Generator("story", "instructions", "test"))
+
         self.assertEqual(self.events, ["voice_free", "gemma_free", "image_free",
                                       "plan", "plan_free", "image_start", "image",
                                       "image_free", "voice", "voice_free", "gemma_free"])
@@ -85,10 +89,13 @@ class WorkerTests(unittest.TestCase):
                 self.fail("Cancelled generator consumed another batch")
             finally:
                 self.events.append("plan_free")
+
         worker = app.Generator("story", "instructions", "test")
         worker.scenes_ready.connect(lambda *args: worker.cancel())
+
         with patch.object(app, "stream_story", side_effect=stream):
             self.run_worker(worker)
+
         self.assertIn("plan_free", self.events)
         self.image.assert_not_called()
         self.voice.assert_not_called()
@@ -97,10 +104,41 @@ class WorkerTests(unittest.TestCase):
     def test_cancel_during_gpu_handoff_does_not_load_gemma(self):
         worker = app.Generator("story", "instructions", "test")
         self.release.side_effect = worker.cancel
+
         with patch.object(app, "stream_story") as stream:
             self.run_worker(worker)
+
         stream.assert_not_called()
         self.assertEqual(self.finished, ["Cancelled."])
+
+    def test_video_worker_exports_video(self):
+        progress = []
+
+        def export_video(scenes, output_path, cancelled, progress):
+            progress("Rendering video scene 1 of 1...")
+            return output_path
+
+        worker = app.VideoWorker([self.scene], "video.mp4")
+        worker.progress.connect(progress.append)
+
+        with patch.object(app.video, "export_video", side_effect=export_video) as export:
+            self.run_worker(worker)
+
+        export.assert_called_once()
+        self.assertEqual(progress, ["Rendering video scene 1 of 1..."])
+        self.assertEqual(self.finished, ["Video exported: video.mp4"])
+        self.assertFalse(self.failed)
+
+    def test_cancelled_video_worker_does_not_export(self):
+        worker = app.VideoWorker([self.scene], "video.mp4")
+        worker.cancel()
+
+        with patch.object(app.video, "export_video") as export:
+            self.run_worker(worker)
+
+        export.assert_not_called()
+        self.assertEqual(self.finished, ["Cancelled."])
+        self.assertFalse(self.failed)
 
 
 class VoiceTests(unittest.TestCase):
@@ -130,6 +168,7 @@ class VoiceTests(unittest.TestCase):
              patch.object(voice.Qwen3TTSModel, "from_pretrained") as load:
             with self.assertRaisesRegex(RuntimeError, "requires CUDA"):
                 voice._model()
+
         load.assert_not_called()
 
     def test_partial_snapshot_is_completed_before_loading(self):
@@ -139,6 +178,7 @@ class VoiceTests(unittest.TestCase):
              patch.object(voice, "_complete_snapshot", return_value=False), \
              patch.object(voice.Qwen3TTSModel, "from_pretrained") as load:
             voice._model()
+
         self.assertEqual(download.call_count, 2)
         self.assertEqual(load.call_args.args, ("complete",))
 
@@ -148,16 +188,27 @@ class VoiceTests(unittest.TestCase):
             required = ["config.json", "generation_config.json", "preprocessor_config.json",
                         "tokenizer_config.json", "vocab.json", "merges.txt",
                         "speech_tokenizer/config.json", "speech_tokenizer/preprocessor_config.json"]
+
             for name in required:
                 path = root / name
                 path.parent.mkdir(exist_ok=True)
                 path.write_text("{}")
+
             (root / "model.safetensors").write_bytes(b"weights")
             self.assertFalse(voice._complete_snapshot(temp))
+
             tokenizer = root / "speech_tokenizer"
+
             (tokenizer / "model.safetensors.index.json").write_text(
-                json.dumps({"weight_map": {"a": "part1", "b": "part2"}}))
+                json.dumps({"weight_map": {"a": "part1", "b": "part2"}})
+            )
+
             (tokenizer / "part1").write_bytes(b"weights")
             self.assertFalse(voice._complete_snapshot(temp))
+
             (tokenizer / "part2").write_bytes(b"weights")
             self.assertTrue(voice._complete_snapshot(temp))
+
+
+if __name__ == "__main__":
+    unittest.main()

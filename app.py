@@ -14,7 +14,8 @@ from PySide6.QtWidgets import (
 from pipeline import comfy_server
 from pipeline.project import Project, load_project, save_project
 from pipeline.scenes import edit_scene, has_asset
-from pipeline.workers import AssetWorker, Generator, can_render_image, can_render_voice, new_run_id
+from pipeline.video import can_export_video
+from pipeline.workers import AssetWorker, Generator, VideoWorker, can_render_image, can_render_voice, new_run_id
 from pipeline.segmenter import (
     DEFAULT_SYSTEM, Scene, split_sentences,
 )
@@ -122,6 +123,8 @@ class Window(QMainWindow):
         self.open_button.clicked.connect(self.open_project)
         self.save_button = QPushButton("Save project as...")
         self.save_button.clicked.connect(self.save_project_as)
+        self.export_button = QPushButton("Export video")
+        self.export_button.clicked.connect(self.export_video)
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.clicked.connect(self.cancel)
         self.reset = QPushButton("Reset prompt")
@@ -147,6 +150,7 @@ class Window(QMainWindow):
         row.addWidget(self.open_button)
         row.addWidget(self.save_button)
         row.addWidget(self.button)
+        row.addWidget(self.export_button)
         row.addWidget(self.cancel_button)
         row.addWidget(self.reset)
         row.addStretch()
@@ -301,6 +305,7 @@ class Window(QMainWindow):
         ):
             widget.setEnabled(not busy)
         self.refresh_detail_buttons()
+        self.refresh_export_button()
 
     def refresh_detail_buttons(self):
         selected = 0 <= self.current < len(self.scenes)
@@ -312,6 +317,11 @@ class Window(QMainWindow):
         )
         self.voice_button.setEnabled(
             selected and not self.busy and can_render_voice(scene)
+        )
+
+    def refresh_export_button(self):
+        self.export_button.setEnabled(
+            not self.busy and not self._closing and can_export_video(self.scenes)
         )
 
     # ---------- status line ----------
@@ -348,6 +358,7 @@ class Window(QMainWindow):
 
     def update_progress(self):
         """Counts finished assets: one image and one audio per scene."""
+        self.refresh_export_button()
         total = len(self.scenes) * 2
         # Nothing to track yet: hide instead of showing an empty bar.
         self.progress_bar.setVisible(bool(total) or self.segmenting)
@@ -658,9 +669,12 @@ class Window(QMainWindow):
 
         self.thread.started.connect(self.worker.run, Qt.ConnectionType.DirectConnection)
         self.worker.progress.connect(self.set_stage)
-        self.worker.image_progress.connect(self.set_image_status)
-        self.worker.voice_progress.connect(self.set_voice_status)
-        self.worker.asset_done.connect(self.asset_ready)
+        if hasattr(self.worker, "image_progress"):
+            self.worker.image_progress.connect(self.set_image_status)
+        if hasattr(self.worker, "voice_progress"):
+            self.worker.voice_progress.connect(self.set_voice_status)
+        if hasattr(self.worker, "asset_done"):
+            self.worker.asset_done.connect(self.asset_ready)
         self.worker.finished.connect(self.status.setText)
         self.worker.failed.connect(self.status.setText)
         self.worker.finished.connect(self.thread.quit, Qt.ConnectionType.DirectConnection)
@@ -741,6 +755,27 @@ class Window(QMainWindow):
             self.status.setText("All assets are complete." if complete else "Add narration text and image prompts to render missing assets.")
             return
         self.run_assets(rows_without_image, rows_without_audio)
+
+    def export_video(self):
+        if self.busy or self._closing:
+            return
+        if not can_export_video(self.scenes):
+            self.status.setText("Generate all images and narration before exporting.")
+            return
+        if not self.autosave():
+            return
+
+        self.player.stop()
+        directory = self.project_path.parent if self.project_path else Path(__file__).parent / "output" / self.run_id
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export video", str(directory / "video.mp4"), "MP4 video (*.mp4)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".mp4"):
+            path += ".mp4"
+
+        self.start_worker(VideoWorker(self.scenes, path))
 
     def cancel(self):
         if self.worker:

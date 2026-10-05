@@ -7,7 +7,7 @@ from datetime import datetime
 import soundfile as sf
 from PySide6.QtCore import QObject, Signal, Slot
 
-from pipeline import comfy_server, images, voice
+from pipeline import comfy_server, images, voice, video
 from pipeline.segmenter import Scene, stream_story, unload_model as unload_scenes
 
 # ---------- shared pipeline helpers ----------
@@ -180,3 +180,50 @@ class Generator(AssetWorker):
         ]
 
 
+class VideoWorker(QObject):
+    """Export an immutable scene snapshot as a final MP4."""
+
+    progress = Signal(str)
+    finished = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, scenes: list[Scene], output_path: str):
+        super().__init__()
+        self.scenes = [
+            scene.model_copy(deep=True)
+            for scene in scenes
+        ]
+        self.output_path = output_path
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
+
+    @Slot()
+    def run(self):
+        try:
+            if self.cancelled:
+                self.finished.emit("Cancelled.")
+                return
+
+            path = video.export_video(
+                self.scenes,
+                self.output_path,
+                cancelled=lambda: self.cancelled,
+                progress=self.progress.emit,
+            )
+
+        except InterruptedError as error:
+            if self.cancelled:
+                self.finished.emit("Cancelled.")
+            else:
+                self.failed.emit(f"Failed: {error}")
+            return
+
+        except Exception as error:
+            self.failed.emit(f"Failed: {error}")
+            return
+
+        self.finished.emit(
+            f"Video exported: {path}"
+        )
