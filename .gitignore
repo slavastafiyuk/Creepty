@@ -1,1 +1,49 @@
+
+# Generated files
 /output/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDEs
+.idea/
+.vscode/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Build and distribution
+build/
+dist/
+*.spec
+
+# Temporary files
+*.tmp
+*.bak
+*.part
+
+# Operating system
+.DS_Store
+Thumbs.db
+desktop.ini
