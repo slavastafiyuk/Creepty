@@ -18,22 +18,35 @@ All AI inference runs locally using Ollama, ComfyUI and Qwen3-TTS — no externa
 - GPU/VRAM-aware model orchestration
 - Cancellation, retries and error recovery
 - Regression tests and benchmarking tools
+- Final MP4 video export with FFmpeg (1080 × 1920, H.264/AAC)
+
 
 ## Architecture
 
 ```mermaid
+
+
 flowchart TD
+
     A[Story] --> B[Ollama / Gemma]
+
     B --> C[Scene Planning]
 
-    C --> D[ComfyUI / FLUX]
+    C --> D[ComfyUI / FLUX.2]
+
     C --> E[Qwen3-TTS]
 
     D --> F[Generated Images]
+
     E --> G[Narration Audio]
 
     F --> H[Editable Creepty Project]
+
     G --> H
+
+    H --> I[FFmpeg Video Export]
+
+    I --> J[Final MP4]
 ```
 
 ## Current stack
@@ -45,7 +58,7 @@ flowchart TD
 | Images | ComfyUI with FLUX.2 Klein 4B FP8 |
 | Narration | Qwen3-TTS 1.7B CustomVoice, English, Ryan |
 | Voice execution | CUDA, BF16 main model, FP32 waveform decoder, and PyTorch SDPA |
-| Output formats | PNG images and PCM-16 WAV audio at 24 kHz |
+| Output formats | PNG images, PCM-16 WAV audio (24 kHz), and MP4 video (H.264/AAC, 1080 × 1920, 30 FPS) |
 
 The current image workflow generates 768 × 1344 images with 4 steps, the Euler sampler, and CFG 1. Narration uses the same speaker throughout a story, with mood instructions controlling delivery.
 
@@ -74,6 +87,8 @@ The setup script:
 2. Downloads the Qwen narrator weights without loading the model into memory.
 3. Installs Ollama if needed and pulls `gemma4:e4b`.
 4. Installs or updates ComfyUI and downloads the image model, text encoder, and VAE.
+5. Installs FFmpeg through WinGet if it is not already available.
+
 
 ComfyUI uses its own virtual environment and CUDA 12.8 PyTorch wheels. Its default installation directory is `C:\AI\ComfyUI`. To use another directory, set `CREEPTY_COMFY_DIR` before both setup and launch:
 
@@ -87,7 +102,8 @@ This PowerShell setting applies to the current session. Use the same value whene
 
 Ollama must be running when pulling the model and generating scenes. Creepty starts ComfyUI automatically when needed, or reuses an existing instance at `http://127.0.0.1:8188`. Changing `CREEPTY_COMFY_DIR` changes the installation path, not the API address.
 
-The root `setup.bat` calls `setup_qwen-tts.bat`, `setup_ollama.bat`, and `setup_comfyui.bat` directly. The Qwen installer creates the application environment and installs its dependencies as well as the narrator weights; there is no intermediate application setup wrapper.
+
+The root `setup.bat` runs `setup_qwen-tts.bat`, `setup_ollama.bat`, `setup_comfyui.bat`, and `setup_ffmpeg.bat` in sequence. Setup stops if any stage fails. The Qwen installer creates the application environment and installs its dependencies as well as the narrator weights; there is no intermediate application setup wrapper.
 
 ComfyUI setup stops on environment, dependency, or model download failures. Downloads use temporary `.part` files and are published only after a successful, nonempty download. Existing empty model files are downloaded again.
 
@@ -104,6 +120,8 @@ To update only the application environment and narrator dependencies:
 3. Select a scene to inspect its text, image prompt, mood, image, and audio.
 4. Edit scenes as needed. Use **Insert**, **Delete**, **Split**, **Up**, and **Down** to organize them.
 5. Use **Generate image** or **Generate voice** to regenerate the selected scene's asset, or **Generate missing** to fill assets that do not exist yet.
+6. Once all scenes have valid images and narration, click **Export video** to produce the final MP4.
+
 
 Changing narration text or mood marks both assets for regeneration. Changing only the image prompt marks only the image. **Generate missing** also detects files removed from disk. Old generated files remain on disk; edits do not delete them. Scene editing is disabled during generation, and results carry a scene identifier and revision to prevent late results from attaching to changed text.
 
@@ -116,6 +134,46 @@ Supported narration moods are `mysterious`, `fear`, `dread`, `passion`, `tense`,
 Narration is currently configured for English with the Ryan voice. Language and speaker settings are defined in the code rather than selected in the interface.
 
 **Cancel** stops the submitted image job or prevents subsequent work. An active scene-planning or narration call may need to finish before cancellation takes effect. Closing the window requests cancellation and keeps the event loop alive until the worker and GPU cleanup finish. Ollama calls use a 5-second connection timeout and 180-second read timeout (30 seconds for unloading). These are network timeouts, not a hard deadline for GPU inference.
+
+
+## Video export
+
+Creepty can assemble generated scenes into a single vertical MP4 video using FFmpeg.
+
+Each scene combines its generated image with its narration audio. The image remains visible for the measured duration of the corresponding WAV file.
+
+### Export settings
+
+| Setting | Value |
+|---|---|
+| Resolution | 1080 × 1920 (9:16) |
+| Frame rate | 30 FPS |
+| Video codec | H.264 (libx264) |
+| Video quality | CRF 18 |
+| Audio codec | AAC |
+| Audio bitrate | 192 kbps |
+| Audio sample rate | 48 kHz |
+
+### Export workflow
+
+1. Generate or restore a Creepty project.
+2. Ensure every scene has an image and narration.
+3. Click **Export video**.
+4. Choose the destination MP4 file.
+5. Creepty renders each scene and joins the clips in their existing order.
+
+Export runs in a background worker to keep the desktop interface responsive.
+
+The export process supports cancellation and uses a temporary output file. The destination is replaced only after the export completes successfully.
+
+### Current limitations
+
+- Images remain static throughout their scenes.
+- Animated camera movements and transitions are not yet supported.
+- Subtitles and background music are not automatically added.
+
+Video export does not require additional AI inference. It uses previously generated assets.
+
 
 ## GPU execution and memory management
 
@@ -148,6 +206,7 @@ Generated assets are saved under `output/<run_id>/`, using names such as `scene_
 | [pipeline/workflows/image.json](pipeline/workflows/image.json) | Image workflow, models, resolution, sampler, and step count |
 | [pipeline/voice.py](pipeline/voice.py) | Narrator, language, mood instructions, and voice sampling settings |
 | [pipeline/comfy_server.py](pipeline/comfy_server.py) | ComfyUI process lifecycle and GPU memory handoff |
+| [pipeline/video.py](pipeline/video.py) | FFmpeg video rendering, scene concatenation, and export cancellation |
 | [requirements.txt](requirements.txt) | Application dependencies |
 | [benchmarks/](benchmarks/) | Measurement runners, report generation, and benchmark dependencies |
 | [scripts/](scripts/) | Environment and model installation scripts |
@@ -235,6 +294,9 @@ The regression tests use mocked services and model loading, real temporary media
 An earlier GPU implementation was also validated on 4 October 2026 with a complete generation, image regeneration, and voice regeneration. The run confirmed CUDA/BF16/SDPA narration, 768 × 1344 images, valid 24 kHz WAV files, and model cleanup between phases.
 
 Local benchmark reports and samples are stored in `output/benchmarks/`; implementation validation reports and samples are in `output/validation/`. The entire `output/` directory is ignored by Git, so these artifacts are not included in a fresh checkout. Timings are specific to the tested machine and workload.
+
+Video export unit tests cover validation, worker orchestration, and successful output publication using mocks. A full FFmpeg integration test is not yet included in the automated test suite.
+
 
 ## License
 
