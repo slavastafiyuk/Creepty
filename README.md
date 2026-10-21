@@ -297,6 +297,14 @@ Local benchmark reports and samples are stored in `output/benchmarks/`; implemen
 
 Video export unit tests cover validation, worker orchestration, and successful output publication using mocks. A full FFmpeg integration test is not yet included in the automated test suite.
 
+## ❤️ Support the Project
+
+I work on this project in my free time because I enjoy building things and learning along the way.
+
+If you find it useful or simply like what I'm working on, you can [support me on GitHub Sponsors](https://github.com/sponsors/slavastafiyuk).
+
+Any support is genuinely appreciated. Thank you! ❤️
+
 
 ## License
 
